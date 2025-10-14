@@ -1,11 +1,11 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v2.2: PW-Login, Top-500 Auswahl, robuste API (Retry + Status),
+# v2.3: PW-Login, Top-500 Auswahl, robuste API (Retry + Diagnose),
 #       farbige "Signals & Levels", Persistenz nach Logout,
 #       Telegram-Alerts (optional), Risk-Tools
 #
-# Streamlit Secrets (Advanced settings → Secrets) TOML:
+# In Streamlit (Advanced settings → Secrets) als TOML setzen:
 # APP_PASSWORD = "DeinStarkesPasswort"
 # TELEGRAM_BOT_TOKEN = "123:abc"   # optional
 # TELEGRAM_CHAT_ID   = "123456789" # optional
@@ -80,7 +80,7 @@ CG_BASE = "https://api.coingecko.com/api/v3"
 
 # ----------------- HTTP helper (robust + Diagnose) -------
 def _get_json(url, params=None, timeout=40, retries=5, backoff=1.8):
-    """HTTP GET mit Retry/Backoff. Gibt Dict mit ok/json/status/error zurück."""
+    """HTTP GET mit Retry/Backoff. Rückgabe: dict mit ok/json/status/error."""
     headers = {"User-Agent": "smartmoney-dashboard/1.0 (+streamlit)"}
     last_err = ""
     for i in range(retries):
@@ -129,27 +129,38 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
+    """
+    Historische Preise/Volumen. Bei API-Fehler -> leerer DF mit df.attrs['status'] != 'ok'.
+    """
     resp = _get_json(
         f"{CG_BASE}/coins/{coin_id}/market_chart",
         {"vs_currency": FIAT, "days": days, "interval": "daily"}
     )
+
+    def _empty(status_text: str) -> pd.DataFrame:
+        df = pd.DataFrame(columns=["timestamp", "price", "volume"])
+        df.attrs["status"] = status_text
+        return df
+
     if not resp.get("ok"):
-        return pd.DataFrame({"__status__":[f"err:{resp.get('status')}"], "timestamp":[], "price":[], "volume":[]})
+        return _empty(f"err:{resp.get('status')}")
     data = resp["json"]
     prices = data.get("prices", [])
-    vols = data.get("total_volumes", [])
+    vols   = data.get("total_volumes", [])
+
     if not prices:
-        return pd.DataFrame({"__status__":["empty"], "timestamp":[], "price":[], "volume":[]})
+        return _empty("empty")
+
     dfp = pd.DataFrame(prices, columns=["ts","price"])
     dfv = pd.DataFrame(vols,    columns=["ts","volume"])
     df = dfp.merge(dfv, on="ts", how="left")
     df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True, errors="coerce")
     df = df[["timestamp","price","volume"]].dropna()
-    df["__status__"] = "ok"
+    df.attrs["status"] = "ok"
     return df
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cg_simple_price(ids: list[str]) -> pd.DataFrame:
+def cg_simple_price(ids) -> pd.DataFrame:
     if not ids:
         return pd.DataFrame()
     resp = _get_json(
@@ -167,15 +178,15 @@ def cg_simple_price(ids: list[str]) -> pd.DataFrame:
         if c not in df.columns: df[c] = np.nan
     return df[cols].rename(columns={"current_price":"price","total_volume":"volume_24h"})
 
-def calc_local_levels(dfd: pd.DataFrame, lookback: int = 20) -> tuple[float, float]:
+def calc_local_levels(dfd: pd.DataFrame, lookback: int = 20):
     if dfd.empty:
         return (np.nan, np.nan)
     d = dfd.copy().reset_index(drop=True)
-    hist = d.iloc[:-1].tail(lookback)  # Widerstand/Support ohne letzte Kerze
+    hist = d.iloc[:-1].tail(lookback)
     if hist.empty:
         return (np.nan, np.nan)
     resistance = float(hist["price"].max())
-    support = float(hist["price"].min())
+    support    = float(hist["price"].min())
     return resistance, support
 
 def volume_signals(dfd: pd.DataFrame) -> dict:
@@ -279,8 +290,8 @@ scan_now = st.sidebar.button("🔔 Watchlist jetzt scannen")
 
 # in Session ablegen (für Persistenz)
 st.session_state["selected_ids"] = selected_ids
-st.session_state["min_mktcap"] = min_mktcap
-st.session_state["min_volume"] = min_volume
+st.session_state["min_mktcap"]   = min_mktcap
+st.session_state["min_volume"]   = min_volume
 st.session_state["vol_surge_thresh"] = vol_surge_thresh
 st.session_state["lookback_res"] = lookback_res
 st.session_state["alerts_enabled"] = alerts_enabled
@@ -309,17 +320,15 @@ if not spot.empty:
 
 # ----------------- Signals table --------------
 rows, history_cache = [], {}
+
 for cid in selected_ids:
     time.sleep(0.25)  # Drossel reduziert Rate-Limit-Treffer
     hist = cg_market_chart(cid, days=days_hist)
 
-    # Diagnose-Status lesen
-    status_val = None
-    if not hist.empty and "__status__" in hist.columns:
-        status_vals = hist["__status__"].unique().tolist()
-        status_val = status_vals[0] if status_vals else None
+    # Status aus Attribut lesen
+    status_val = hist.attrs.get("status", "ok") if hist is not None else "no_df"
 
-    if hist is None or hist.empty or (status_val and status_val != "ok"):
+    if hist is None or hist.empty or (status_val != "ok"):
         rows.append({
             "id": cid, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
             "Breakout_MA": False, "Vol_Surge_x": np.nan,
@@ -329,15 +338,17 @@ for cid in selected_ids:
         })
         continue
 
+    # Daten vorbereiten
     history_cache[cid] = hist
     dfd = hist.copy()
     dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
     dfd = dfd.set_index("timestamp").sort_index().resample("1D").last().dropna()
 
+    # Signale berechnen
     t_sig = trend_signals(dfd)
     v_sig = volume_signals(dfd)
     resistance, support = calc_local_levels(dfd, lookback=lookback_res)
-    last = dfd.iloc[-1]
+    last  = dfd.iloc[-1]
     price = float(last["price"])
     volsurge = v_sig["vol_ratio_1d_vs_7d"]
     is_valid_vol = not np.isnan(volsurge)
@@ -351,20 +362,21 @@ for cid in selected_ids:
         "Resistance": resistance, "Support": support,
         "Breakout_Resistance": breakout_res,
         "Distribution_Risk": v_sig["distribution_risk"],
-        "Entry_Signal": entry_ok and breakout_res, "status": "ok"
+        "Entry_Signal": entry_ok and breakout_res,
+        "status": "ok"
     })
 
 signals_df = pd.DataFrame(rows)
 st.subheader("🔎 Signals & Levels")
 
 def _row_style(row):
-    # Entry_Signal -> grün; Distribution_Risk -> rot; Vor-Signale -> gelb
+    # Entry grün, Distribution rot, Breakout gelb
     if bool(row.get("Entry_Signal", False)):
-        return ['background-color: #e6ffed'] * len(row)  # hellgrün
+        return ['background-color: #e6ffed'] * len(row)
     if bool(row.get("Distribution_Risk", False)):
-        return ['background-color: #ffecec'] * len(row)  # hellrot
+        return ['background-color: #ffecec'] * len(row)
     if bool(row.get("Breakout_MA", False)) or bool(row.get("Breakout_Resistance", False)):
-        return ['background-color: #fff9e6'] * len(row)  # hellgelb
+        return ['background-color: #fff9e6'] * len(row)
     return [''] * len(row)
 
 if not signals_df.empty:
@@ -408,7 +420,7 @@ if coin_select:
     d = history_cache.get(coin_select)
     if d is None or d.empty:
         d = cg_market_chart(coin_select, days=st.session_state["days_hist"])
-    if d is None or d.empty or ("__status__" in d.columns and d["__status__"].iat[0] != "ok"):
+    if d is None or d.empty or (d.attrs.get("status","ok") != "ok"):
         st.warning("Keine Historie verfügbar (API-Limit oder leere Daten). Probiere weniger Coins oder kürzere Historie.")
     else:
         dfd = d.copy()
@@ -443,12 +455,12 @@ if coin_select:
         # Position sizing & trailing stop
         st.markdown("### 🧮 Position & Trailing Stop")
         c1, c2, c3, c4 = st.columns(4)
-        portfolio = c1.number_input("Portfolio (USD)", min_value=0.0, value=8000.0, step=100.0)
-        risk_pct = c2.slider("Risiko/Trade (%)", 0.5, 3.0, 2.0, 0.1)
-        stop_pct = c3.slider("Stop-Entfernung (%)", 3.0, 25.0, 8.0, 0.5)
+        portfolio   = c1.number_input("Portfolio (USD)", min_value=0.0, value=8000.0, step=100.0)
+        risk_pct    = c2.slider("Risiko/Trade (%)", 0.5, 3.0, 2.0, 0.1)
+        stop_pct    = c3.slider("Stop-Entfernung (%)", 3.0, 25.0, 8.0, 0.5)
         entry_price = c4.number_input("Entry-Preis", min_value=0.0, value=float(dfd['price'].iloc[-1]), step=0.001, format="%.6f")
         max_loss = portfolio * (risk_pct/100.0)
-        size = max_loss / (stop_pct/100.0) if stop_pct>0 else 0.0
+        size     = max_loss / (stop_pct/100.0) if stop_pct>0 else 0.0
         st.write(f"**Max. Verlust:** ${max_loss:,.2f} • **Positionsgröße (≈):** ${size:,.2f}")
 
         st.markdown("#### Trailing Stop")
