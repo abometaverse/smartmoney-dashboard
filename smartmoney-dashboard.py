@@ -1,7 +1,8 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v2: PW-Login, Top-500-Auswahl, Signals, Volumen-Dry-Up, Alerts, Risk-Tools
+# v2: PW-Login, Top-500 Auswahl, Signals, Volumen-Dry-Up, Alerts, Risk-Tools
+# + Persistenz der letzten Einstellungen + farbliche Hervorhebung
 #
 # Streamlit Secrets (Advanced settings → Secrets) TOML:
 # APP_PASSWORD = "DeinStarkesPasswort"
@@ -33,7 +34,14 @@ def auth_gate() -> None:
         col1, col2 = top.columns([6,1])
         col1.success("Zugriff gewährt.")
         if col2.button("Logout"):
+            # letzten Zustand speichern
+            save_state([
+                "selected_ids", "min_mktcap", "min_volume",
+                "vol_surge_thresh", "lookback_res", "alerts_enabled", "days_hist"
+            ])
             st.session_state["AUTH_OK"] = False
+            st.success("Einstellungen gespeichert.")
+            time.sleep(0.5)
             st.rerun()
         return
 
@@ -43,10 +51,27 @@ def auth_gate() -> None:
         if ok:
             if pw == secret_pw:
                 st.session_state["AUTH_OK"] = True
+                # zuvor gespeicherten Zustand wiederherstellen
+                restore_state([
+                    "selected_ids", "min_mktcap", "min_volume",
+                    "vol_surge_thresh", "lookback_res", "alerts_enabled", "days_hist"
+                ])
                 st.rerun()
             else:
                 st.error("Falsches Passwort.")
     st.stop()
+
+# ----------------- Session Helper ------------------
+def save_state(keys):
+    for k in keys:
+        if k in st.session_state:
+            st.session_state[f"_saved_{k}"] = st.session_state[k]
+
+def restore_state(keys):
+    for k in keys:
+        saved_key = f"_saved_{k}"
+        if saved_key in st.session_state:
+            st.session_state[k] = st.session_state[saved_key]
 
 auth_gate()
 
@@ -198,21 +223,42 @@ def trailing_stop(current_high: float, trail_pct: float) -> float:
 # ----------------- Sidebar --------------------
 st.sidebar.header("Settings")
 
+# Defaults in Session vorbereiten (für Persistenz)
+for k, v in {
+    "selected_ids": [],
+    "min_mktcap": 300_000_000,
+    "min_volume": 50_000_000,
+    "vol_surge_thresh": 1.5,
+    "lookback_res": 20,
+    "alerts_enabled": True,
+    "days_hist": 180
+}.items():
+    st.session_state.setdefault(k, v)
+
+# Historie-Tage einstellbar (Performance/Hitrate)
+days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15)
+st.session_state["days_hist"] = days_hist
+
 # Top-500 Auswahl mit Suche
 top_df = cg_top_coins(limit=500)
 if top_df.empty:
     st.sidebar.warning("Top-Liste konnte nicht geladen werden (API-Limit?). Fallback-Auswahl.")
     default_ids = ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
-    selected_ids = st.sidebar.multiselect(
+    selected_labels = st.sidebar.multiselect(
         "Watchlist (Fallback)",
         options=default_ids,
-        default=default_ids[:3],
-        help="API gerade nicht erreichbar – einfache Auswahl."
+        default=st.session_state["selected_ids"] or default_ids[:3],
     )
+    selected_ids = selected_labels
 else:
     top_df["label"] = top_df.apply(lambda r: f"{r['name']} ({str(r['symbol']).upper()}) — {r['id']}", axis=1)
-    default_ids = ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
-    default_labels = top_df[top_df["id"].isin(default_ids)]["label"].tolist()
+    # aktuelle Auswahl aus Session (falls vorhanden) als Default
+    if st.session_state["selected_ids"]:
+        default_labels = top_df[top_df["id"].isin(st.session_state["selected_ids"])]["label"].tolist()
+    else:
+        default_ids = ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
+        default_labels = top_df[top_df["id"].isin(default_ids)]["label"].tolist()
+
     selected_labels = st.sidebar.multiselect(
         "Watchlist auswählen (Top 500, Suche per Tippen)",
         options=top_df["label"].tolist(),
@@ -222,19 +268,26 @@ else:
     label_to_id = dict(zip(top_df["label"], top_df["id"]))
     selected_ids = [label_to_id[l] for l in selected_labels]
 
-# Optional manuelle ID
 manual = st.sidebar.text_input("Zusätzliche ID (optional)", value="", help="Nur wenn Coin nicht in Top 500.")
 if manual.strip():
     selected_ids.append(manual.strip())
 if not selected_ids:
     selected_ids = ["bitcoin","ethereum"]
 
-min_mktcap = st.sidebar.number_input("Min Market Cap (USD)", min_value=0, value=300_000_000, step=50_000_000)
-min_volume = st.sidebar.number_input("Min 24h Volume (USD)", min_value=0, value=50_000_000, step=10_000_000)
-vol_surge_thresh = st.sidebar.slider("Vol Surge vs 7d (x)", 1.0, 5.0, 1.5, 0.1)
-lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 60, 20, 1)
-alerts_enabled = st.sidebar.checkbox("Telegram-Alerts aktivieren (Secrets nötig)", value=True)
+min_mktcap = st.sidebar.number_input("Min Market Cap (USD)", min_value=0, value=int(st.session_state["min_mktcap"]), step=50_000_000)
+min_volume = st.sidebar.number_input("Min 24h Volume (USD)", min_value=0, value=int(st.session_state["min_volume"]), step=10_000_000)
+vol_surge_thresh = st.sidebar.slider("Vol Surge vs 7d (x)", 1.0, 5.0, float(st.session_state["vol_surge_thresh"]), 0.1)
+lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 60, int(st.session_state["lookback_res"]), 1)
+alerts_enabled = st.sidebar.checkbox("Telegram-Alerts aktivieren (Secrets nötig)", value=bool(st.session_state["alerts_enabled"]))
 scan_now = st.sidebar.button("🔔 Watchlist jetzt scannen")
+
+# in Session ablegen (für Persistenz beim Logout)
+st.session_state["selected_ids"] = selected_ids
+st.session_state["min_mktcap"] = min_mktcap
+st.session_state["min_volume"] = min_volume
+st.session_state["vol_surge_thresh"] = vol_surge_thresh
+st.session_state["lookback_res"] = lookback_res
+st.session_state["alerts_enabled"] = alerts_enabled
 
 st.caption("🔒 Passwortschutz aktiv — setze `APP_PASSWORD` in Streamlit Secrets.  •  Alerts via Telegram (optional).")
 
@@ -261,8 +314,16 @@ if not spot.empty:
 # ----------------- Signals table --------------
 rows, history_cache = [], {}
 for cid in selected_ids:
-    hist = cg_market_chart(cid, days=180)
-    if hist.empty:
+    time.sleep(0.25)  # drosselt API-Aufrufe leicht (Rate-Limit)
+    hist = cg_market_chart(cid, days=days_hist)
+    if hist is None or hist.empty:
+        rows.append({
+            "id": cid, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
+            "Breakout_MA": False, "Vol_Surge_x": np.nan,
+            "Resistance": np.nan, "Support": np.nan,
+            "Breakout_Resistance": False, "Distribution_Risk": False,
+            "Entry_Signal": False, "status": "no data / rate limited"
+        })
         continue
     history_cache[cid] = hist
     dfd = hist.copy()
@@ -276,7 +337,7 @@ for cid in selected_ids:
     price = float(last["price"])
     volsurge = v_sig["vol_ratio_1d_vs_7d"]
     is_valid_vol = not np.isnan(volsurge)
-    breakout_res = bool(price >= resistance * 1.0005) if not math.isnan(resistance) else False
+    breakout_res = bool(price >= (resistance * 1.0005)) if not math.isnan(resistance) else False
     entry_ok = bool(t_sig["breakout_ma"] and is_valid_vol and (volsurge >= vol_surge_thresh))
 
     rows.append({
@@ -286,13 +347,37 @@ for cid in selected_ids:
         "Resistance": resistance, "Support": support,
         "Breakout_Resistance": breakout_res,
         "Distribution_Risk": v_sig["distribution_risk"],
-        "Entry_Signal": entry_ok and breakout_res
+        "Entry_Signal": entry_ok and breakout_res, "status": "ok"
     })
 
 signals_df = pd.DataFrame(rows)
 st.subheader("🔎 Signals & Levels")
+
+def _row_style(row):
+    # Priorität: Entry_Signal -> grün; Distribution_Risk -> rot; ansonsten neutral
+    if row.get("Entry_Signal", False):
+        return ['background-color: #e6ffed'] * len(row)  # hellgrün
+    if row.get("Distribution_Risk", False):
+        return ['background-color: #ffecec'] * len(row)  # hellrot
+    if row.get("Breakout_MA", False) or row.get("Breakout_Resistance", False):
+        return ['background-color: #fff9e6'] * len(row)  # hellgelb
+    return [''] * len(row)
+
 if not signals_df.empty:
-    st.dataframe(signals_df, use_container_width=True, hide_index=True)
+    # schöne Formate
+    display_df = signals_df.copy()
+    for c in ["price","MA20","MA50","Vol_Surge_x","Resistance","Support"]:
+        if c in display_df.columns:
+            display_df[c] = pd.to_numeric(display_df[c], errors="coerce")
+    styled = display_df.style.apply(_row_style, axis=1).format({
+        "price": "{:.4f}",
+        "MA20": "{:.4f}",
+        "MA50": "{:.4f}",
+        "Vol_Surge_x": "{:.2f}",
+        "Resistance": "{:.4f}",
+        "Support": "{:.4f}",
+    })
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # Optional Alerts
     if scan_now and alerts_enabled:
@@ -323,7 +408,7 @@ coin_select = st.selectbox(
 if coin_select:
     d = history_cache.get(coin_select)
     if d is None or d.empty:
-        d = cg_market_chart(coin_select, days=180)
+        d = cg_market_chart(coin_select, days=days_hist)
     if not d.empty:
         dfd = d.copy()
         dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
