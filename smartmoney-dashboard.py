@@ -288,6 +288,14 @@ lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 
 alerts_enabled = st.sidebar.checkbox("Telegram-Alerts aktivieren (Secrets nötig)", value=bool(st.session_state["alerts_enabled"]))
 scan_now = st.sidebar.button("🔔 Watchlist jetzt scannen")
 
+# ----------------- Batching -----------------
+batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 10, 3, 1)
+st.session_state.setdefault("scan_index", 0)
+
+if scan_now:
+    # Index erhöhen für nächsten Scan
+    st.session_state["scan_index"] = (st.session_state["scan_index"] + batch_size) % max(1, len(selected_ids))
+
 # in Session ablegen (für Persistenz)
 st.session_state["selected_ids"] = selected_ids
 st.session_state["min_mktcap"]   = min_mktcap
@@ -321,7 +329,18 @@ if not spot.empty:
 # ----------------- Signals table --------------
 rows, history_cache = [], {}
 
-for cid in selected_ids:
+# Batch-Scanning
+start = st.session_state.get("scan_index", 0)
+end = min(start + batch_size, len(selected_ids))
+batch = selected_ids[start:end]
+
+if not batch:
+    st.warning("Keine Coins im aktuellen Batch. Starte Scan erneut.")
+    st.stop()
+
+st.info(f"⏳ Scanne Coins {start+1}–{end} von {len(selected_ids)} ...")
+
+for cid in batch:
     time.sleep(0.25)  # Drossel reduziert Rate-Limit-Treffer
     hist = cg_market_chart(cid, days=days_hist)
 
@@ -469,3 +488,8 @@ if coin_select:
         high_since_entry = t2.number_input("Höchster Kurs seit Entry", min_value=0.0, value=float(dfd['price'].iloc[-1]), step=0.001, format="%.6f")
         tstop = trailing_stop(high_since_entry, trail_pct)
         st.write(f"Trailing Stop bei **${tstop:,.3f}** (High {high_since_entry:,.3f}, Trail {trail_pct:.1f}%)")
+
+if end == len(selected_ids):
+    st.success("✅ Alle Coins einmal gescannt (kompletter Zyklus).")
+else:
+    st.info(f"➡️ Nächster Scan lädt Coins {end+1}–{min(end+batch_size,len(selected_ids))}.")
