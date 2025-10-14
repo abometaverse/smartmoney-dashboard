@@ -22,7 +22,7 @@ def auth_gate() -> None:
         col1.success("Zugriff gewährt.")
         if col2.button("Logout"):
             st.session_state["AUTH_OK"] = False
-            st.experimental_rerun()
+            st.rerun()
         return
     with st.form("login_form", clear_on_submit=False):
         pw = st.text_input("Passwort eingeben", type="password")
@@ -30,7 +30,7 @@ def auth_gate() -> None:
         if ok:
             if pw == secret_pw:
                 st.session_state["AUTH_OK"] = True
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Falsches Passwort.")
     st.stop()
