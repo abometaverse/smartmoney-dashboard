@@ -1,8 +1,9 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v2: PW-Login, Top-500 Auswahl, Signals, Volumen-Dry-Up, Alerts, Risk-Tools
-# + Persistenz der letzten Einstellungen + farbliche Hervorhebung
+# v2.2: PW-Login, Top-500 Auswahl, robuste API (Retry + Status),
+#       farbige "Signals & Levels", Persistenz nach Logout,
+#       Telegram-Alerts (optional), Risk-Tools
 #
 # Streamlit Secrets (Advanced settings → Secrets) TOML:
 # APP_PASSWORD = "DeinStarkesPasswort"
@@ -21,6 +22,18 @@ import streamlit as st
 # ----------------- App Config -----------------
 st.set_page_config(page_title="Smart Money Dashboard — Geschützt", layout="wide")
 
+# ----------------- Session Helper ------------------
+def save_state(keys):
+    for k in keys:
+        if k in st.session_state:
+            st.session_state[f"_saved_{k}"] = st.session_state[k]
+
+def restore_state(keys):
+    for k in keys:
+        saved_key = f"_saved_{k}"
+        if saved_key in st.session_state:
+            st.session_state[k] = st.session_state[saved_key]
+
 # ----------------- Auth Gate ------------------
 def auth_gate() -> None:
     st.title("🧠 Smart Money Dashboard — Geschützt")
@@ -34,7 +47,6 @@ def auth_gate() -> None:
         col1, col2 = top.columns([6,1])
         col1.success("Zugriff gewährt.")
         if col2.button("Logout"):
-            # letzten Zustand speichern
             save_state([
                 "selected_ids", "min_mktcap", "min_volume",
                 "vol_surge_thresh", "lookback_res", "alerts_enabled", "days_hist"
@@ -51,7 +63,6 @@ def auth_gate() -> None:
         if ok:
             if pw == secret_pw:
                 st.session_state["AUTH_OK"] = True
-                # zuvor gespeicherten Zustand wiederherstellen
                 restore_state([
                     "selected_ids", "min_mktcap", "min_volume",
                     "vol_surge_thresh", "lookback_res", "alerts_enabled", "days_hist"
@@ -61,26 +72,15 @@ def auth_gate() -> None:
                 st.error("Falsches Passwort.")
     st.stop()
 
-# ----------------- Session Helper ------------------
-def save_state(keys):
-    for k in keys:
-        if k in st.session_state:
-            st.session_state[f"_saved_{k}"] = st.session_state[k]
-
-def restore_state(keys):
-    for k in keys:
-        saved_key = f"_saved_{k}"
-        if saved_key in st.session_state:
-            st.session_state[k] = st.session_state[saved_key]
-
 auth_gate()
 
 # ----------------- Constants ------------------
 FIAT = "usd"
 CG_BASE = "https://api.coingecko.com/api/v3"
 
-# ----------------- HTTP helper (robust) -------
+# ----------------- HTTP helper (robust + Diagnose) -------
 def _get_json(url, params=None, timeout=40, retries=5, backoff=1.8):
+    """HTTP GET mit Retry/Backoff. Gibt Dict mit ok/json/status/error zurück."""
     headers = {"User-Agent": "smartmoney-dashboard/1.0 (+streamlit)"}
     last_err = ""
     for i in range(retries):
@@ -92,7 +92,6 @@ def _get_json(url, params=None, timeout=40, retries=5, backoff=1.8):
             if r.status_code in (429, 502, 503):
                 time.sleep(backoff * (i+1))
                 continue
-            # andere Fehler = abbrechen
             return {"ok": False, "json": None, "status": r.status_code, "error": r.text[:300]}
         except requests.RequestException as e:
             last_err = str(e)[:200]
@@ -111,19 +110,16 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
     per_page = 250
     pages = int(np.ceil(limit / per_page))
     for page in range(1, pages + 1):
-        data = _get_json(
+        resp = _get_json(
             f"{CG_BASE}/coins/markets",
             {
-                "vs_currency": FIAT,
-                "order": "market_cap_desc",
-                "per_page": per_page,
-                "page": page,
-                "sparkline": "false",
+                "vs_currency": FIAT, "order": "market_cap_desc",
+                "per_page": per_page, "page": page, "sparkline": "false",
             },
         )
-        if not data:
+        if not resp.get("ok"):
             break
-        part = pd.DataFrame(data)[["id", "symbol", "name", "market_cap"]]
+        part = pd.DataFrame(resp["json"])[["id", "symbol", "name", "market_cap"]]
         rows.append(part)
     if not rows:
         return pd.DataFrame(columns=["id","symbol","name","market_cap"])
@@ -154,11 +150,14 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cg_simple_price(ids: list[str]) -> pd.DataFrame:
-    if not ids: return pd.DataFrame()
+    if not ids:
+        return pd.DataFrame()
     resp = _get_json(
         f"{CG_BASE}/coins/markets",
-        {"vs_currency": FIAT, "ids": ",".join(ids),
-         "order":"market_cap_desc","per_page": max(1,len(ids)),"page":1,"sparkline":"false"}
+        {
+            "vs_currency": FIAT, "ids": ",".join(ids),
+            "order":"market_cap_desc","per_page": max(1,len(ids)),"page":1,"sparkline":"false"
+        }
     )
     if not resp.get("ok"):
         return pd.DataFrame()
@@ -167,7 +166,6 @@ def cg_simple_price(ids: list[str]) -> pd.DataFrame:
     for c in cols:
         if c not in df.columns: df[c] = np.nan
     return df[cols].rename(columns={"current_price":"price","total_volume":"volume_24h"})
-
 
 def calc_local_levels(dfd: pd.DataFrame, lookback: int = 20) -> tuple[float, float]:
     if dfd.empty:
@@ -223,7 +221,7 @@ def trailing_stop(current_high: float, trail_pct: float) -> float:
 # ----------------- Sidebar --------------------
 st.sidebar.header("Settings")
 
-# Defaults in Session vorbereiten (für Persistenz)
+# Defaults in Session (für Persistenz)
 for k, v in {
     "selected_ids": [],
     "min_mktcap": 300_000_000,
@@ -235,7 +233,6 @@ for k, v in {
 }.items():
     st.session_state.setdefault(k, v)
 
-# Historie-Tage einstellbar (Performance/Hitrate)
 days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15)
 st.session_state["days_hist"] = days_hist
 
@@ -252,7 +249,6 @@ if top_df.empty:
     selected_ids = selected_labels
 else:
     top_df["label"] = top_df.apply(lambda r: f"{r['name']} ({str(r['symbol']).upper()}) — {r['id']}", axis=1)
-    # aktuelle Auswahl aus Session (falls vorhanden) als Default
     if st.session_state["selected_ids"]:
         default_labels = top_df[top_df["id"].isin(st.session_state["selected_ids"])]["label"].tolist()
     else:
@@ -281,7 +277,7 @@ lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 
 alerts_enabled = st.sidebar.checkbox("Telegram-Alerts aktivieren (Secrets nötig)", value=bool(st.session_state["alerts_enabled"]))
 scan_now = st.sidebar.button("🔔 Watchlist jetzt scannen")
 
-# in Session ablegen (für Persistenz beim Logout)
+# in Session ablegen (für Persistenz)
 st.session_state["selected_ids"] = selected_ids
 st.session_state["min_mktcap"] = min_mktcap
 st.session_state["min_volume"] = min_volume
@@ -314,12 +310,12 @@ if not spot.empty:
 # ----------------- Signals table --------------
 rows, history_cache = [], {}
 for cid in selected_ids:
-    time.sleep(0.25)
+    time.sleep(0.25)  # Drossel reduziert Rate-Limit-Treffer
     hist = cg_market_chart(cid, days=days_hist)
 
     # Diagnose-Status lesen
     status_val = None
-    if "__status__" in hist.columns:
+    if not hist.empty and "__status__" in hist.columns:
         status_vals = hist["__status__"].unique().tolist()
         status_val = status_vals[0] if status_vals else None
 
@@ -362,28 +358,23 @@ signals_df = pd.DataFrame(rows)
 st.subheader("🔎 Signals & Levels")
 
 def _row_style(row):
-    # Priorität: Entry_Signal -> grün; Distribution_Risk -> rot; ansonsten neutral
-    if row.get("Entry_Signal", False):
+    # Entry_Signal -> grün; Distribution_Risk -> rot; Vor-Signale -> gelb
+    if bool(row.get("Entry_Signal", False)):
         return ['background-color: #e6ffed'] * len(row)  # hellgrün
-    if row.get("Distribution_Risk", False):
+    if bool(row.get("Distribution_Risk", False)):
         return ['background-color: #ffecec'] * len(row)  # hellrot
-    if row.get("Breakout_MA", False) or row.get("Breakout_Resistance", False):
+    if bool(row.get("Breakout_MA", False)) or bool(row.get("Breakout_Resistance", False)):
         return ['background-color: #fff9e6'] * len(row)  # hellgelb
     return [''] * len(row)
 
 if not signals_df.empty:
-    # schöne Formate
     display_df = signals_df.copy()
     for c in ["price","MA20","MA50","Vol_Surge_x","Resistance","Support"]:
         if c in display_df.columns:
             display_df[c] = pd.to_numeric(display_df[c], errors="coerce")
     styled = display_df.style.apply(_row_style, axis=1).format({
-        "price": "{:.4f}",
-        "MA20": "{:.4f}",
-        "MA50": "{:.4f}",
-        "Vol_Surge_x": "{:.2f}",
-        "Resistance": "{:.4f}",
-        "Support": "{:.4f}",
+        "price": "{:.4f}", "MA20": "{:.4f}", "MA50": "{:.4f}",
+        "Vol_Surge_x": "{:.2f}", "Resistance": "{:.4f}", "Support": "{:.4f}",
     })
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -416,14 +407,17 @@ coin_select = st.selectbox(
 if coin_select:
     d = history_cache.get(coin_select)
     if d is None or d.empty:
-        d = cg_market_chart(coin_select, days=days_hist)
-    if not d.empty:
+        d = cg_market_chart(coin_select, days=st.session_state["days_hist"])
+    if d is None or d.empty or ("__status__" in d.columns and d["__status__"].iat[0] != "ok"):
+        st.warning("Keine Historie verfügbar (API-Limit oder leere Daten). Probiere weniger Coins oder kürzere Historie.")
+    else:
         dfd = d.copy()
         dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
         dfd = dfd.set_index("timestamp").sort_index().resample("1D").last().dropna()
 
         r, s = calc_local_levels(dfd, lookback=lookback_res)
         v_sig = volume_signals(dfd)
+
         # Price + MAs + Levels
         fig, ax = plt.subplots()
         ax.plot(dfd.index, dfd["price"], label="Price")
