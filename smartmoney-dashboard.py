@@ -80,21 +80,25 @@ FIAT = "usd"
 CG_BASE = "https://api.coingecko.com/api/v3"
 
 # ----------------- HTTP helper (robust) -------
-def _get_json(url, params=None, timeout=30, retries=3, backoff=1.5):
+def _get_json(url, params=None, timeout=40, retries=5, backoff=1.8):
     headers = {"User-Agent": "smartmoney-dashboard/1.0 (+streamlit)"}
+    last_err = ""
     for i in range(retries):
         try:
             r = requests.get(url, params=params, timeout=timeout, headers=headers)
             if r.status_code == 200:
-                return r.json()
+                return {"ok": True, "json": r.json(), "status": 200}
+            last_err = f"HTTP {r.status_code}"
             if r.status_code in (429, 502, 503):
                 time.sleep(backoff * (i+1))
                 continue
-            r.raise_for_status()
-        except requests.RequestException:
+            # andere Fehler = abbrechen
+            return {"ok": False, "json": None, "status": r.status_code, "error": r.text[:300]}
+        except requests.RequestException as e:
+            last_err = str(e)[:200]
             time.sleep(backoff * (i+1))
             continue
-    return None
+    return {"ok": False, "json": None, "status": None, "error": last_err or "request failed"}
 
 # ----------------- Helpers --------------------
 def ma(series: pd.Series, window: int) -> pd.Series:
@@ -129,45 +133,41 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
-    data = _get_json(
+    resp = _get_json(
         f"{CG_BASE}/coins/{coin_id}/market_chart",
         {"vs_currency": FIAT, "days": days, "interval": "daily"}
     )
-    if not data:
-        return pd.DataFrame()
+    if not resp.get("ok"):
+        return pd.DataFrame({"__status__":[f"err:{resp.get('status')}"], "timestamp":[], "price":[], "volume":[]})
+    data = resp["json"]
     prices = data.get("prices", [])
     vols = data.get("total_volumes", [])
     if not prices:
-        return pd.DataFrame()
+        return pd.DataFrame({"__status__":["empty"], "timestamp":[], "price":[], "volume":[]})
     dfp = pd.DataFrame(prices, columns=["ts","price"])
     dfv = pd.DataFrame(vols,    columns=["ts","volume"])
     df = dfp.merge(dfv, on="ts", how="left")
     df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True, errors="coerce")
     df = df[["timestamp","price","volume"]].dropna()
+    df["__status__"] = "ok"
     return df
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cg_simple_price(ids: list[str]) -> pd.DataFrame:
-    if not ids:
-        return pd.DataFrame()
-    data = _get_json(
+    if not ids: return pd.DataFrame()
+    resp = _get_json(
         f"{CG_BASE}/coins/markets",
-        {
-            "vs_currency": FIAT,
-            "ids": ",".join(ids),
-            "order":"market_cap_desc",
-            "per_page": len(ids) if len(ids) > 0 else 1,
-            "page":1,
-            "sparkline":"false"
-        }
+        {"vs_currency": FIAT, "ids": ",".join(ids),
+         "order":"market_cap_desc","per_page": max(1,len(ids)),"page":1,"sparkline":"false"}
     )
-    if not data:
+    if not resp.get("ok"):
         return pd.DataFrame()
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(resp["json"])
     cols = ["id","symbol","name","current_price","market_cap","total_volume","price_change_percentage_24h"]
     for c in cols:
         if c not in df.columns: df[c] = np.nan
     return df[cols].rename(columns={"current_price":"price","total_volume":"volume_24h"})
+
 
 def calc_local_levels(dfd: pd.DataFrame, lookback: int = 20) -> tuple[float, float]:
     if dfd.empty:
@@ -314,17 +314,25 @@ if not spot.empty:
 # ----------------- Signals table --------------
 rows, history_cache = [], {}
 for cid in selected_ids:
-    time.sleep(0.25)  # drosselt API-Aufrufe leicht (Rate-Limit)
+    time.sleep(0.25)
     hist = cg_market_chart(cid, days=days_hist)
-    if hist is None or hist.empty:
+
+    # Diagnose-Status lesen
+    status_val = None
+    if "__status__" in hist.columns:
+        status_vals = hist["__status__"].unique().tolist()
+        status_val = status_vals[0] if status_vals else None
+
+    if hist is None or hist.empty or (status_val and status_val != "ok"):
         rows.append({
             "id": cid, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
             "Breakout_MA": False, "Vol_Surge_x": np.nan,
             "Resistance": np.nan, "Support": np.nan,
             "Breakout_Resistance": False, "Distribution_Risk": False,
-            "Entry_Signal": False, "status": "no data / rate limited"
+            "Entry_Signal": False, "status": status_val or "no data"
         })
         continue
+
     history_cache[cid] = hist
     dfd = hist.copy()
     dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
