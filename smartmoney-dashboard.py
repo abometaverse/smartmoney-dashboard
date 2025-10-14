@@ -201,7 +201,9 @@ st.markdown("---")
 st.subheader("📈 Detail & Risk-Tools")
 coin_select = st.selectbox("Coin", options=[r["id"] for _, r in signals_df.iterrows()] if not signals_df.empty else watchlist)
 if coin_select:
-    d = history_cache.get(coin_select) or cg_market_chart(coin_select, days=180)
+    d = history_cache.get(coin_select)
+    if d is None or d.empty:
+        d = cg_market_chart(coin_select, days=180)
     if not d.empty:
         dfd = d.set_index("timestamp").resample("1D").last().dropna()
         r, s = calc_local_levels(dfd)
