@@ -428,7 +428,8 @@ def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res
             "Breakout_Resistance": breakout_res,
             "Distribution_Risk": v_sig["distribution_risk"],
             "Entry_Signal": entry_ok and breakout_res, "status": "ok"
-            "source": status_val  # zeigt err/empty an
+            "status": "ok",                      # ← hier Komma am Ende!
+            "source": status_val                 # zeigt err/empty an
         })
 
     signals_df = pd.DataFrame(rows)
