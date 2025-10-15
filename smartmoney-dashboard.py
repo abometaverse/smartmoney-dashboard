@@ -432,9 +432,12 @@ if search_query and len(search_query.strip()) >= 2:
     if search_df.empty:
         st.sidebar.info("Keine Treffer für diese Suche gefunden.")
     else:
-        search_df["label"] = search_df.apply(
-            lambda r: f"{r['name']} ({str(r['symbol']).upper()}) — {r['id']}", axis=1
-        )
+        def _format_search_label(row: pd.Series) -> str:
+            rank_val = row.get("market_cap_rank")
+            prefix = f"Rang {int(rank_val):03d} · " if pd.notna(rank_val) else ""
+            return f"{prefix}{row['name']} ({str(row['symbol']).upper()}) — {row['id']}"
+
+        search_df["label"] = search_df.apply(_format_search_label, axis=1)
         default_search_ids = [
             cid for cid in st.session_state.get("selected_ids", [])
             if cid in search_df["id"].tolist()
