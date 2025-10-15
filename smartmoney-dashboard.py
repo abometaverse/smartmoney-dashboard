@@ -146,8 +146,15 @@ def cg_top_coins(limit: int = 100) -> pd.DataFrame:
         part = pd.DataFrame(resp["json"])[["id", "symbol", "name", "market_cap"]]
         rows.append(part)
     if not rows:
-        return pd.DataFrame(columns=["id","symbol","name","market_cap"])
-    df = pd.concat(rows, ignore_index=True).drop_duplicates(subset=["id"]).head(limit)
+        return pd.DataFrame(columns=["id","symbol","name","market_cap","rank"])
+    df = pd.concat(rows, ignore_index=True).drop_duplicates(subset=["id"])
+    df["market_cap"] = pd.to_numeric(df.get("market_cap"), errors="coerce")
+    df = (
+        df.sort_values("market_cap", ascending=False)
+        .head(limit)
+        .reset_index(drop=True)
+    )
+    df["rank"] = df.index + 1
     return df
 
 
@@ -262,7 +269,7 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
         df["price"]     = pd.to_numeric(df["close"], errors="coerce")
         df["volume"]    = pd.to_numeric(df["volume"], errors="coerce")
         df = df[["timestamp","price","volume"]].dropna()
-        if df.empty:
+        if df.empty():
             return _empty("empty_binance")
         df = df.sort_values("timestamp").tail(int(days)+1)
         df.attrs["status"] = "ok_binance"
@@ -425,9 +432,12 @@ if search_query and len(search_query.strip()) >= 2:
     if search_df.empty:
         st.sidebar.info("Keine Treffer für diese Suche gefunden.")
     else:
-        search_df["label"] = search_df.apply(
-            lambda r: f"{r['name']} ({str(r['symbol']).upper()}) — {r['id']}", axis=1
-        )
+        def _format_search_label(row: pd.Series) -> str:
+            rank_val = row.get("market_cap_rank")
+            prefix = f"Rang {int(rank_val):03d} · " if pd.notna(rank_val) else ""
+            return f"{prefix}{row['name']} ({str(row['symbol']).upper()}) — {row['id']}"
+
+        search_df["label"] = search_df.apply(_format_search_label, axis=1)
         default_search_ids = [
             cid for cid in st.session_state.get("selected_ids", [])
             if cid in search_df["id"].tolist()
@@ -456,13 +466,19 @@ forced_ids = sorted(set(filter(None, forced_ids)))
 if forced_ids:
     extra = cg_simple_price(forced_ids)
     if not extra.empty:
-        extra = extra[["id", "symbol", "name", "market_cap"]].drop_duplicates(subset=["id"])
+        extra = (
+            extra[["id", "symbol", "name", "market_cap"]]
+            .drop_duplicates(subset=["id"])
+        )
+        extra["market_cap"] = pd.to_numeric(extra.get("market_cap"), errors="coerce")
+        extra["rank"] = np.nan
         if top_df.empty:
             top_df = extra
         else:
             top_df = (
                 pd.concat([top_df, extra], ignore_index=True)
-                .drop_duplicates(subset=["id"])
+                .drop_duplicates(subset=["id"], keep="first")
+                .sort_values(["rank", "market_cap"], ascending=[True, False], na_position="last")
                 .reset_index(drop=True)
             )
 
@@ -477,7 +493,14 @@ if top_df.empty:
     )
     selected_ids = selected_labels
 else:
-    top_df["label"] = top_df.apply(lambda r: f"{r['name']} ({str(r['symbol']).upper()}) — {r['id']}", axis=1)
+    top_df = top_df.sort_values(["rank", "market_cap"], ascending=[True, False], na_position="last").reset_index(drop=True)
+
+    def _format_top_label(row: pd.Series) -> str:
+        rank_val = row.get("rank")
+        prefix = f"Rang {int(rank_val):03d} · " if pd.notna(rank_val) else ""
+        return f"{prefix}{row['name']} ({str(row['symbol']).upper()}) — {row['id']}"
+
+    top_df["label"] = top_df.apply(_format_top_label, axis=1)
     default_seed = st.session_state["selected_ids"] or [
         "bitcoin",
         "ethereum",
