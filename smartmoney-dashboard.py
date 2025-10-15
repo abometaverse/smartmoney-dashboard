@@ -90,8 +90,13 @@ def get_http() -> requests.Session:
     return s
 
 # ----------------- HTTP helper (robust + Diagnose) -------
-def _get_json(url, params=None, timeout=40, retries=7, backoff=2.2):
-    """HTTP GET mit Retry/Backoff. Rückgabe: dict mit ok/json/status/error."""
+def _get_json(url, params=None, timeout=12, retries=2, backoff=1.6):
+    """
+    Schneller, fails fast:
+    - kurzer Timeout (12s)
+    - wenige Retries
+    - 429/50x werden kurz gebackofft, alles andere bricht sofort ab
+    """
     session = get_http()
     last_err = ""
     for i in range(retries):
@@ -99,16 +104,19 @@ def _get_json(url, params=None, timeout=40, retries=7, backoff=2.2):
             r = session.get(url, params=params, timeout=timeout)
             if r.status_code == 200:
                 return {"ok": True, "json": r.json(), "status": 200}
-            last_err = f"HTTP {r.status_code}"
-            if r.status_code in (429, 502, 503):
+            # gezielt nur bei Rate-Limit/Serverfehlern kurz warten
+            if r.status_code in (429, 502, 503, 504):
+                last_err = f"HTTP {r.status_code}"
                 time.sleep(backoff * (i + 1))
                 continue
+            # alle anderen Fehler sofort zurückgeben
             return {"ok": False, "json": None, "status": r.status_code, "error": r.text[:300]}
         except requests.RequestException as e:
             last_err = str(e)[:200]
             time.sleep(backoff * (i + 1))
             continue
     return {"ok": False, "json": None, "status": None, "error": last_err or "request failed"}
+
 
 # ----------------- Helpers --------------------
 def ma(series: pd.Series, window: int) -> pd.Series:
@@ -135,16 +143,17 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
-    """Historische Preise/Volumen von CoinGecko, mit Fallback auf Binance für Majors."""
+    """Historische Preise/Volumen – zuerst CoinGecko (schnell), sonst Fallback Binance."""
     def _empty(status_text: str) -> pd.DataFrame:
         df = pd.DataFrame(columns=["timestamp", "price", "volume"])
         df.attrs["status"] = status_text
         return df
 
-    # 1) Erst CoinGecko versuchen
+    # ---------- 1) Schneller Versuch CoinGecko ----------
     resp = _get_json(
         f"{CG_BASE}/coins/{coin_id}/market_chart",
-        {"vs_currency": FIAT, "days": days, "interval": "daily"}
+        {"vs_currency": FIAT, "days": days, "interval": "daily"},
+        timeout=10, retries=1, backoff=1.2  # kurz und knapp
     )
     if resp.get("ok"):
         data = resp["json"]
@@ -157,11 +166,12 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
             df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True, errors="coerce")
             df = df[["timestamp","price","volume"]].dropna()
             if not df.empty:
+                df = df.sort_values("timestamp").tail(int(days)+1)
                 df.attrs["status"] = "ok_cg"
                 return df
-        # sonst fällt es unten auf Binance zurück
+        # wenn leer -> gleich Fallback
 
-    # 2) Fallback: Binance-Klines (nur Majors/USDT-Paare)
+    # ---------- 2) Binance-Fallback (USDT-Paare) ----------
     symbol_map = {
         "bitcoin": "BTCUSDT",
         "ethereum": "ETHUSDT",
@@ -172,19 +182,18 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
     }
     sym = symbol_map.get(coin_id)
     if not sym:
-        # generischer Versuch aus Symbol (falls Top500 geladen)
+        # generisch: versuche Symbol aus Top500
         try:
             top = cg_top_coins(limit=500)
-            sym_guess = top.loc[top["id"] == coin_id, "symbol"].str.upper().iloc[0] + "USDT"
-            sym = sym_guess
+            sym = top.loc[top["id"] == coin_id, "symbol"].str.upper().iloc[0] + "USDT"
         except Exception:
-            return _empty(f"err:{resp.get('status') if resp else 'no_cg'}")
+            return _empty("no_symbol")
 
-    # Binance liefert OHLCV; wir nehmen Close & Volume
-    # max 1000 candles/Call; 1d * days passt
-    r = get_http().get("https://api.binance.com/api/v3/klines",
-                       params={"symbol": sym, "interval": "1d", "limit": min(1000, int(days)+5)},
-                       timeout=30)
+    r = get_http().get(
+        "https://api.binance.com/api/v3/klines",
+        params={"symbol": sym, "interval": "1d", "limit": min(1000, int(days)+5)},
+        timeout=10
+    )
     if r.status_code != 200:
         return _empty(f"err_binance:{r.status_code}")
 
@@ -192,7 +201,6 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
         kl = r.json()
         if not kl:
             return _empty("empty_binance")
-        # Kline: [openTime, open, high, low, close, volume, ...]
         df = pd.DataFrame(kl, columns=[
             "openTime","open","high","low","close","volume",
             "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
@@ -203,7 +211,6 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
         df = df[["timestamp","price","volume"]].dropna()
         if df.empty:
             return _empty("empty_binance")
-        # Bei Bedarf kürzen auf gewünschte Tage
         df = df.sort_values("timestamp").tail(int(days)+1)
         df.attrs["status"] = "ok_binance"
         return df
@@ -381,6 +388,7 @@ if "history_cache" not in st.session_state:
 
 def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res):
     rows, history_cache = [], {}
+
     start = st.session_state.get("scan_index", 0)
     end = min(start + batch_size, len(selected_ids))
     batch = selected_ids[start:end]
@@ -397,15 +405,22 @@ def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res
         hist = cg_market_chart(cid, days=days_hist)
         status_val = hist.attrs.get("status", "ok") if hist is not None else "no_df"
 
-        if hist is None or hist.empty or (status_val != "ok"):
-            rows.append({"id": cid, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
-                         "Breakout_MA": False, "Vol_Surge_x": np.nan,
-                         "Resistance": np.nan, "Support": np.nan,
-                         "Breakout_Resistance": False, "Distribution_Risk": False,
-                         "Entry_Signal": False, "status": status_val or "no data"})
-            continue
+        # --- Fehlerfall: leere/fehlerhafte Daten -> nur EIN Row, dann weiter ---
+        if (hist is None) or hist.empty or (status_val != "ok_cg" and status_val != "ok_binance" and status_val != "ok"):
+            rows.append({
+                "id": cid, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
+                "Breakout_MA": False, "Vol_Surge_x": np.nan,
+                "Resistance": np.nan, "Support": np.nan,
+                "Breakout_Resistance": False, "Distribution_Risk": False,
+                "Entry_Signal": False,
+                "status": status_val or "no data",
+                "source": status_val  # zeigt err/empty/err_binance/... an
+            })
+            continue  # <<< WICHTIG
 
+        # --- Erfolgsfall ---
         history_cache[cid] = hist
+
         dfd = hist.copy()
         dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
         dfd = dfd.set_index("timestamp").sort_index().resample("1D").last().dropna()
@@ -413,6 +428,7 @@ def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res
         t_sig = trend_signals(dfd)
         v_sig = volume_signals(dfd)
         resistance, support = calc_local_levels(dfd, lookback=lookback_res)
+
         last = dfd.iloc[-1]
         price = float(last["price"])
         volsurge = v_sig["vol_ratio_1d_vs_7d"]
@@ -420,17 +436,8 @@ def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res
         breakout_res = bool(price >= (resistance * 1.0005)) if not math.isnan(resistance) else False
         entry_ok = bool(t_sig["breakout_ma"] and is_valid_vol and (volsurge >= vol_surge_thresh))
 
-        rows.append({
-            "id": cid, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
-            "Breakout_MA": False, "Vol_Surge_x": np.nan,
-            "Resistance": np.nan, "Support": np.nan,
-            "Breakout_Resistance": False, "Distribution_Risk": False,
-            "Entry_Signal": False,
-            "status": status_val or "no data",
-            "source": status_val
-        })
+        src = hist.attrs.get("status", "ok").replace("ok_", "")  # cg oder binance
 
-        src = hist.attrs.get("status", "ok").replace("ok_", "")
         rows.append({
             "id": cid, "price": price,
             "MA20": t_sig["ma20"], "MA50": t_sig["ma50"],
@@ -445,7 +452,7 @@ def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res
 
     signals_df = pd.DataFrame(rows)
     # Fortschritt für nächsten Scan merken
-    st.session_state["scan_index"] = (end) % max(1, len(selected_ids))
+    st.session_state["scan_index"] = end % max(1, len(selected_ids))
     return signals_df, history_cache, start, end
 
 # Scan ausführen nur bei Klick (oder beim allerersten Start, wenn noch kein Cache existiert)
