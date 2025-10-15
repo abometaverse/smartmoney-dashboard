@@ -132,7 +132,7 @@ def ma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=max(2, window//2)).mean()
 
 @st.cache_data(ttl=3600, show_spinner=True)
-def cg_top_coins(limit: int = 500) -> pd.DataFrame:
+def cg_top_coins(limit: int = 100) -> pd.DataFrame:
     rows = []
     per_page = 250
     pages = int(np.ceil(limit / per_page))
@@ -149,6 +149,32 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
         return pd.DataFrame(columns=["id","symbol","name","market_cap"])
     df = pd.concat(rows, ignore_index=True).drop_duplicates(subset=["id"]).head(limit)
     return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cg_search_coins(query: str) -> pd.DataFrame:
+    q = (query or "").strip()
+    if len(q) < 2:
+        return pd.DataFrame(columns=["id", "symbol", "name", "market_cap_rank"])
+
+    resp = _get_json(f"{CG_BASE}/search", {"query": q}, timeout=8, retries=1, backoff=1.2)
+    if not resp.get("ok"):
+        return pd.DataFrame(columns=["id", "symbol", "name", "market_cap_rank"])
+
+    coins = resp.get("json", {}).get("coins", [])
+    if not coins:
+        return pd.DataFrame(columns=["id", "symbol", "name", "market_cap_rank"])
+
+    df = pd.DataFrame(coins)
+    if df.empty or "id" not in df.columns:
+        return pd.DataFrame(columns=["id", "symbol", "name", "market_cap_rank"])
+
+    keep_cols = {"id": "id", "name": "name", "symbol": "symbol", "market_cap_rank": "market_cap_rank"}
+    df = df[[c for c in keep_cols if c in df.columns]].rename(columns=keep_cols)
+    df = df.dropna(subset=["id"]).drop_duplicates(subset=["id"])
+    df["market_cap_rank"] = pd.to_numeric(df.get("market_cap_rank"), errors="coerce")
+    df = df.sort_values("market_cap_rank", na_position="last").head(20)
+    return df.reset_index(drop=True)
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
@@ -385,9 +411,45 @@ days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["
 
 # Watchlist
 ensure_ids = {"easy": "easyfi", "easyfi": "easyfi"}
-top_df = cg_top_coins(limit=500)
+top_df = cg_top_coins(limit=100)
 
-forced_ids = list({ensure_ids.get(cid, cid) for cid in st.session_state.get("selected_ids", []) if cid})
+search_ids: list[str] = []
+search_query = st.sidebar.text_input(
+    "Weitere Coins suchen (Echtzeit)",
+    key="search_query",
+    placeholder="Mindestens 2 Zeichen — z.B. pepe oder arbitrum",
+)
+
+if search_query and len(search_query.strip()) >= 2:
+    search_df = cg_search_coins(search_query.strip())
+    if search_df.empty:
+        st.sidebar.info("Keine Treffer für diese Suche gefunden.")
+    else:
+        search_df["label"] = search_df.apply(
+            lambda r: f"{r['name']} ({str(r['symbol']).upper()}) — {r['id']}", axis=1
+        )
+        default_search_ids = [
+            cid for cid in st.session_state.get("selected_ids", [])
+            if cid in search_df["id"].tolist()
+        ]
+        default_search_labels = search_df[search_df["id"].isin(default_search_ids)]["label"].tolist()
+        selected_search_labels = st.sidebar.multiselect(
+            "Suchtreffer hinzufügen",
+            options=search_df["label"].tolist(),
+            default=default_search_labels,
+            help="Treffer anklicken, um sie deiner Watchlist hinzuzufügen.",
+            key="search_results_select",
+        )
+        label_to_id_search = dict(zip(search_df["label"], search_df["id"]))
+        search_ids = [
+            ensure_ids.get(label_to_id_search[label], label_to_id_search[label])
+            for label in selected_search_labels
+        ]
+else:
+    st.sidebar.caption("Mindestens 2 Zeichen eingeben, um zusätzliche Coins in Echtzeit zu finden.")
+
+forced_source = list(st.session_state.get("selected_ids", [])) + search_ids
+forced_ids = list({ensure_ids.get(cid, cid) for cid in forced_source if cid})
 forced_ids.append("easyfi")
 forced_ids = sorted(set(filter(None, forced_ids)))
 
@@ -410,13 +472,13 @@ if top_df.empty:
     selected_labels = st.sidebar.multiselect(
         "Watchlist (Fallback)",
         options=default_ids,
-        default=st.session_state["selected_ids"] or default_ids[:3],
+        default=list(dict.fromkeys((st.session_state["selected_ids"] or default_ids[:3]) + search_ids)),
         key="watchlist_fallback"
     )
     selected_ids = selected_labels
 else:
     top_df["label"] = top_df.apply(lambda r: f"{r['name']} ({str(r['symbol']).upper()}) — {r['id']}", axis=1)
-    default_ids = st.session_state["selected_ids"] or [
+    default_seed = st.session_state["selected_ids"] or [
         "bitcoin",
         "ethereum",
         "solana",
@@ -425,9 +487,10 @@ else:
         "bittensor",
         "easyfi",
     ]
+    default_ids = list(dict.fromkeys(default_seed + search_ids))
     default_labels = top_df[top_df["id"].isin(default_ids)]["label"].tolist()
     selected_labels = st.sidebar.multiselect(
-        "Watchlist auswählen (Top 500, Suche per Tippen)",
+        "Watchlist auswählen (Top 100)",
         options=top_df["label"].tolist(),
         default=default_labels,
         help="Tippe Name oder Ticker, wähle per Klick.",
@@ -436,6 +499,8 @@ else:
     label_to_id = dict(zip(top_df["label"], top_df["id"]))
     selected_ids = [label_to_id[l] for l in selected_labels]
     selected_ids = [ensure_ids.get(cid, cid) for cid in selected_ids]
+
+selected_ids.extend(search_ids)
 
 manual = st.sidebar.text_input("Zusätzliche ID (optional)", value="", key="manual_id")
 if manual.strip():
