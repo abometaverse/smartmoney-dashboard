@@ -269,7 +269,7 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
         df["price"]     = pd.to_numeric(df["close"], errors="coerce")
         df["volume"]    = pd.to_numeric(df["volume"], errors="coerce")
         df = df[["timestamp","price","volume"]].dropna()
-        if df.empty:
+        if df.empty():
             return _empty("empty_binance")
         df = df.sort_values("timestamp").tail(int(days)+1)
         df.attrs["status"] = "ok_binance"
@@ -492,7 +492,7 @@ if top_df.empty:
     selected_labels = st.sidebar.multiselect(
         "Watchlist (Fallback)",
         options=default_ids,
-        default=fallback_defaults,
+        default=list(dict.fromkeys((st.session_state["selected_ids"] or default_ids[:3]) + search_ids)),
         key="watchlist_fallback"
     )
     selected_ids = selected_labels
@@ -564,9 +564,9 @@ st.caption("🔒 Passwortschutz aktiv — setze `APP_PASSWORD` in Secrets.  • 
 
 # ----------------- Checklist ------------------
 with st.expander("📋 Tägliche Checkliste", expanded=False):
-    st.markdown("""
-**Morgens:** Scan → Kandidaten (Breakout + Vol-Surge) notieren, Funding/TVL querprüfen  
-**Mittags:** Entry nur bei Preis > MA20 > MA50 **und** Vol-Surge ≥ Schwelle **und** Breakout über Widerstand  
+    st.markdown("""\
+**Morgens:** Scan → Kandidaten (Breakout + Vol-Surge) notieren, Funding/TVL querprüfen
+**Mittags:** Entry nur bei Preis > MA20 > MA50 **und** Vol-Surge ≥ Schwelle **und** Breakout über Widerstand
 **Abends:** Volumen-Trend prüfen, Trailing Stop nachziehen, Teilgewinne sichern
 """)
 
