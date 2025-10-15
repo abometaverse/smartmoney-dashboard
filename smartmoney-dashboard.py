@@ -421,6 +421,17 @@ def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res
         entry_ok = bool(t_sig["breakout_ma"] and is_valid_vol and (volsurge >= vol_surge_thresh))
 
         rows.append({
+            "id": cid, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
+            "Breakout_MA": False, "Vol_Surge_x": np.nan,
+            "Resistance": np.nan, "Support": np.nan,
+            "Breakout_Resistance": False, "Distribution_Risk": False,
+            "Entry_Signal": False,
+            "status": status_val or "no data",
+            "source": status_val
+        })
+
+        src = hist.attrs.get("status", "ok").replace("ok_", "")
+        rows.append({
             "id": cid, "price": price,
             "MA20": t_sig["ma20"], "MA50": t_sig["ma50"],
             "Breakout_MA": t_sig["breakout_ma"], "Vol_Surge_x": volsurge,
@@ -428,10 +439,9 @@ def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res
             "Breakout_Resistance": breakout_res,
             "Distribution_Risk": v_sig["distribution_risk"],
             "Entry_Signal": entry_ok and breakout_res,
-            "status": "ok",                      # ← hier Komma am Ende!
-            "source": status_val                 # zeigt err/empty an
+            "status": "ok",
+            "source": src
         })
-
 
     signals_df = pd.DataFrame(rows)
     # Fortschritt für nächsten Scan merken
