@@ -9,7 +9,16 @@
 # TELEGRAM_BOT_TOKEN = "123:abc"   # optional
 # TELEGRAM_CHAT_ID   = "123456789" # optional
 # -------------------------------------------------------------
+"""Smart Money Dashboard.
 
+Dieses Skript bündelt alle aktuellen Anpassungen (Support/Resistance,
+Watchlist-Persistenz, Easyfi-Auswahl, Telegram-Alerts) in einer einzigen Datei,
+sodass der komplette Code bei Bedarf einfach kopiert und in Streamlit
+eingesetzt werden kann.
+"""
+
+import base64
+import json
 import math
 import time
 import requests
@@ -123,7 +132,7 @@ def ma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=max(2, window//2)).mean()
 
 @st.cache_data(ttl=3600, show_spinner=True)
-def cg_top_coins(limit: int = 500) -> pd.DataFrame:
+def cg_top_coins(limit: int = 100) -> pd.DataFrame:
     rows = []
     per_page = 250
     pages = int(np.ceil(limit / per_page))
@@ -137,9 +146,42 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
         part = pd.DataFrame(resp["json"])[["id", "symbol", "name", "market_cap"]]
         rows.append(part)
     if not rows:
-        return pd.DataFrame(columns=["id","symbol","name","market_cap"])
-    df = pd.concat(rows, ignore_index=True).drop_duplicates(subset=["id"]).head(limit)
+        return pd.DataFrame(columns=["id","symbol","name","market_cap","rank"])
+    df = pd.concat(rows, ignore_index=True).drop_duplicates(subset=["id"])
+    df["market_cap"] = pd.to_numeric(df.get("market_cap"), errors="coerce")
+    df = (
+        df.sort_values("market_cap", ascending=False)
+        .head(limit)
+        .reset_index(drop=True)
+    )
+    df["rank"] = df.index + 1
     return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cg_search_coins(query: str) -> pd.DataFrame:
+    q = (query or "").strip()
+    if len(q) < 2:
+        return pd.DataFrame(columns=["id", "symbol", "name", "market_cap_rank"])
+
+    resp = _get_json(f"{CG_BASE}/search", {"query": q}, timeout=8, retries=1, backoff=1.2)
+    if not resp.get("ok"):
+        return pd.DataFrame(columns=["id", "symbol", "name", "market_cap_rank"])
+
+    coins = resp.get("json", {}).get("coins", [])
+    if not coins:
+        return pd.DataFrame(columns=["id", "symbol", "name", "market_cap_rank"])
+
+    df = pd.DataFrame(coins)
+    if df.empty or "id" not in df.columns:
+        return pd.DataFrame(columns=["id", "symbol", "name", "market_cap_rank"])
+
+    keep_cols = {"id": "id", "name": "name", "symbol": "symbol", "market_cap_rank": "market_cap_rank"}
+    df = df[[c for c in keep_cols if c in df.columns]].rename(columns=keep_cols)
+    df = df.dropna(subset=["id"]).drop_duplicates(subset=["id"])
+    df["market_cap_rank"] = pd.to_numeric(df.get("market_cap_rank"), errors="coerce")
+    df = df.sort_values("market_cap_rank", na_position="last").head(20)
+    return df.reset_index(drop=True)
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
@@ -171,7 +213,7 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
                 return df
         # wenn leer -> gleich Fallback
 
-       # ---------- 2) Binance-Fallback (USDT-Paare) ----------
+    # ---------- 2) Binance-Fallback (USDT-Paare) ----------
     symbol_map = {
         "bitcoin": "BTCUSDT",
         "ethereum": "ETHUSDT",
@@ -300,6 +342,60 @@ def send_telegram(msg: str) -> bool:
 def trailing_stop(current_high: float, trail_pct: float) -> float:
     return current_high * (1 - trail_pct/100.0)
 
+# ----------------- Persistenz (Mobile/iPhone) --------------------
+PERSIST_KEYS = [
+    "selected_ids",
+    "min_mktcap",
+    "min_volume",
+    "vol_surge_thresh",
+    "lookback_res",
+    "alerts_enabled",
+    "days_hist",
+    "batch_size_slider",
+]
+
+
+def _decode_state(param_value: str) -> dict:
+    try:
+        raw = base64.urlsafe_b64decode(param_value.encode("utf-8"))
+        data = json.loads(raw.decode("utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _encode_state(state: dict) -> str:
+    raw = json.dumps(state, sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8")
+
+
+def load_persisted_state() -> None:
+    params = st.experimental_get_query_params()
+    encoded = params.get("state", [None])[0]
+    if not encoded:
+        return
+    data = _decode_state(encoded)
+    if not data:
+        return
+    for k in PERSIST_KEYS:
+        if k in data:
+            st.session_state.setdefault(k, data[k])
+    st.session_state["_persisted_state"] = params.get("state", [None])[0]
+
+
+def persist_state() -> None:
+    state = {k: st.session_state.get(k) for k in PERSIST_KEYS}
+    encoded = _encode_state(state)
+    if st.session_state.get("_persisted_state") == encoded:
+        return
+    st.experimental_set_query_params(state=encoded)
+    st.session_state["_persisted_state"] = encoded
+
+
+load_persisted_state()
+
 # ----------------- Sidebar --------------------
 st.sidebar.header("Settings")
 
@@ -321,23 +417,112 @@ days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["
 # NICHT erneut in session_state schreiben – der Slider pflegt key="days_hist" selbst
 
 # Watchlist
-top_df = cg_top_coins(limit=500)
+ensure_ids = {"easy": "easyfi", "easyfi": "easyfi"}
+top_df = cg_top_coins(limit=100)
+
+search_ids: list[str] = []
+search_query = st.sidebar.text_input(
+    "Weitere Coins suchen (Echtzeit)",
+    key="search_query",
+    placeholder="Mindestens 2 Zeichen — z.B. pepe oder arbitrum",
+)
+
+if search_query and len(search_query.strip()) >= 2:
+    search_df = cg_search_coins(search_query.strip())
+    if search_df.empty:
+        st.sidebar.info("Keine Treffer für diese Suche gefunden.")
+    else:
+        def _format_search_label(row: pd.Series) -> str:
+            rank_val = row.get("market_cap_rank")
+            prefix = f"Rang {int(rank_val):03d} · " if pd.notna(rank_val) else ""
+            return f"{prefix}{row['name']} ({str(row['symbol']).upper()}) — {row['id']}"
+
+        search_df["label"] = search_df.apply(_format_search_label, axis=1)
+        default_search_ids = [
+            cid for cid in st.session_state.get("selected_ids", [])
+            if cid in search_df["id"].tolist()
+        ]
+        default_search_labels = search_df[search_df["id"].isin(default_search_ids)]["label"].tolist()
+        selected_search_labels = st.sidebar.multiselect(
+            "Suchtreffer hinzufügen",
+            options=search_df["label"].tolist(),
+            default=default_search_labels,
+            help="Treffer anklicken, um sie deiner Watchlist hinzuzufügen.",
+            key="search_results_select",
+        )
+        label_to_id_search = dict(zip(search_df["label"], search_df["id"]))
+        search_ids = [
+            ensure_ids.get(label_to_id_search[label], label_to_id_search[label])
+            for label in selected_search_labels
+        ]
+else:
+    st.sidebar.caption("Mindestens 2 Zeichen eingeben, um zusätzliche Coins in Echtzeit zu finden.")
+
+forced_source = list(st.session_state.get("selected_ids", [])) + search_ids
+forced_ids = list({ensure_ids.get(cid, cid) for cid in forced_source if cid})
+forced_ids.append("easyfi")
+forced_ids = sorted(set(filter(None, forced_ids)))
+
+if forced_ids:
+    extra = cg_simple_price(forced_ids)
+    if not extra.empty:
+        extra = (
+            extra[["id", "symbol", "name", "market_cap"]]
+            .drop_duplicates(subset=["id"])
+        )
+        extra["market_cap"] = pd.to_numeric(extra.get("market_cap"), errors="coerce")
+        extra["rank"] = np.nan
+        if top_df.empty:
+            top_df = extra
+        else:
+            top_df = (
+                pd.concat([top_df, extra], ignore_index=True)
+                .drop_duplicates(subset=["id"], keep="first")
+                .sort_values(["rank", "market_cap"], ascending=[True, False], na_position="last")
+                .reset_index(drop=True)
+            )
+
 if top_df.empty:
     st.sidebar.warning("Top-Liste konnte nicht geladen werden (API-Limit?). Fallback-Auswahl.")
     default_ids = ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
+    stored_selection = st.session_state.get("selected_ids") or []
+    stored_selection = [cid for cid in stored_selection if isinstance(cid, str)]
+    base_defaults = stored_selection or default_ids[:3]
+    candidate_defaults = base_defaults + [cid for cid in search_ids if isinstance(cid, str)]
+
+    fallback_defaults: list[str] = []
+    for cid in candidate_defaults:
+        if cid in default_ids and cid not in fallback_defaults:
+            fallback_defaults.append(cid)
     selected_labels = st.sidebar.multiselect(
         "Watchlist (Fallback)",
         options=default_ids,
-        default=st.session_state["selected_ids"] or default_ids[:3],
+        default=fallback_defaults,
         key="watchlist_fallback"
     )
     selected_ids = selected_labels
 else:
-    top_df["label"] = top_df.apply(lambda r: f"{r['name']} ({str(r['symbol']).upper()}) — {r['id']}", axis=1)
-    default_ids = st.session_state["selected_ids"] or ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
+    top_df = top_df.sort_values(["rank", "market_cap"], ascending=[True, False], na_position="last").reset_index(drop=True)
+
+    def _format_top_label(row: pd.Series) -> str:
+        rank_val = row.get("rank")
+        prefix = f"Rang {int(rank_val):03d} · " if pd.notna(rank_val) else ""
+        return f"{prefix}{row['name']} ({str(row['symbol']).upper()}) — {row['id']}"
+
+    top_df["label"] = top_df.apply(_format_top_label, axis=1)
+    default_seed = st.session_state["selected_ids"] or [
+        "bitcoin",
+        "ethereum",
+        "solana",
+        "arbitrum",
+        "render-token",
+        "bittensor",
+        "easyfi",
+    ]
+    default_ids = list(dict.fromkeys(default_seed + search_ids))
     default_labels = top_df[top_df["id"].isin(default_ids)]["label"].tolist()
     selected_labels = st.sidebar.multiselect(
-        "Watchlist auswählen (Top 500, Suche per Tippen)",
+        "Watchlist auswählen (Top 100)",
         options=top_df["label"].tolist(),
         default=default_labels,
         help="Tippe Name oder Ticker, wähle per Klick.",
@@ -345,10 +530,14 @@ else:
     )
     label_to_id = dict(zip(top_df["label"], top_df["id"]))
     selected_ids = [label_to_id[l] for l in selected_labels]
+    selected_ids = [ensure_ids.get(cid, cid) for cid in selected_ids]
+
+selected_ids.extend(search_ids)
 
 manual = st.sidebar.text_input("Zusätzliche ID (optional)", value="", key="manual_id")
 if manual.strip():
-    selected_ids.append(manual.strip())
+    selected_ids.append(ensure_ids.get(manual.strip(), manual.strip()))
+selected_ids = list(dict.fromkeys(selected_ids))
 if not selected_ids:
     selected_ids = ["bitcoin","ethereum"]
 
@@ -373,6 +562,8 @@ st.session_state["min_volume"]   = min_volume
 st.session_state["vol_surge_thresh"] = vol_surge_thresh
 st.session_state["lookback_res"] = lookback_res
 st.session_state["alerts_enabled"] = alerts_enabled
+
+persist_state()
 
 st.caption("🔒 Passwortschutz aktiv — setze `APP_PASSWORD` in Secrets.  •  Alerts via Telegram (optional).  •  Scans laufen nur auf Klick (Compute-on-Click).")
 
@@ -560,3 +751,73 @@ if coin_select:
 
     # optional Quelle anzeigen
     st.caption(f"Datenquelle: {str(status_val).replace('ok_', '')}")
+
+    df = d.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
+    if df.empty:
+        st.warning("Keine validen Datenpunkte für das Chart gefunden.")
+        st.stop()
+
+    daily = df.set_index("timestamp").resample("1D").last().dropna(subset=["price"])
+    daily["ma20"] = ma(daily["price"], 20)
+    daily["ma50"] = ma(daily["price"], 50)
+    lookback_val = int(st.session_state.get("lookback_res", lookback_res))
+    resistance_lvl, support_lvl = calc_local_levels(daily.reset_index(drop=True), lookback=lookback_val)
+
+    col_chart, col_trail = st.columns([3, 1])
+
+    with col_chart:
+        fig, ax_price = plt.subplots(figsize=(10, 5))
+        ax_price.plot(daily.index, daily["price"], label="Preis", color="#1f77b4", linewidth=2)
+        if daily["ma20"].notna().any():
+            ax_price.plot(daily.index, daily["ma20"], label="MA20", color="#ff7f0e", linestyle="--")
+        if daily["ma50"].notna().any():
+            ax_price.plot(daily.index, daily["ma50"], label="MA50", color="#2ca02c", linestyle=":")
+        if not math.isnan(resistance_lvl):
+            ax_price.axhline(
+                resistance_lvl,
+                color="#d62728",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"Resistance ({lookback_val}d)",
+            )
+        if not math.isnan(support_lvl):
+            ax_price.axhline(
+                support_lvl,
+                color="#17becf",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"Support ({lookback_val}d)",
+            )
+        ax_price.set_ylabel("Preis (USD)")
+        ax_price.grid(True, linestyle=":", alpha=0.4)
+
+        ax_vol = ax_price.twinx()
+        ax_vol.bar(daily.index, daily["volume"], label="Volumen", color="#bbbbbb", alpha=0.4)
+        ax_vol.set_ylabel("Volumen")
+
+        handles, labels = ax_price.get_legend_handles_labels()
+        if handles:
+            ax_price.legend(handles, labels, loc="upper left")
+        fig.autofmt_xdate()
+        st.pyplot(fig, clear_figure=True)
+
+    with col_trail:
+        res_text = f"${resistance_lvl:,.2f}" if not math.isnan(resistance_lvl) else "–"
+        sup_text = f"${support_lvl:,.2f}" if not math.isnan(support_lvl) else "–"
+        st.metric("Resistance", res_text, help=f"Berechnet aus den letzten {lookback_val} Tagen (ohne aktuelle Kerze).")
+        st.metric("Support", sup_text, help=f"Berechnet aus den letzten {lookback_val} Tagen (ohne aktuelle Kerze).")
+        trail_pct = st.slider("Trailing Stop (%)", min_value=2, max_value=30, value=10, step=1)
+        lookback_window = min(lookback_val, len(daily))
+        if lookback_window > 0:
+            window_slice = daily["price"].iloc[-lookback_window:]
+            recent_high = float(window_slice.max())
+            stop_level = trailing_stop(recent_high, trail_pct)
+            st.metric("Trailing Stop", f"${stop_level:,.2f}")
+        else:
+            st.metric("Trailing Stop", "–")
+
+    st.caption(
+        "Preis (Linie) mit MA20/MA50, Widerstand/Support (Lookback) sowie Volumen (Balken). Rechts: Levels und dynamischer Trailing Stop."
+    )
