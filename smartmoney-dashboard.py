@@ -9,6 +9,13 @@
 # TELEGRAM_BOT_TOKEN = "123:abc"   # optional
 # TELEGRAM_CHAT_ID   = "123456789" # optional
 # -------------------------------------------------------------
+"""Smart Money Dashboard.
+
+Dieses Skript bündelt alle aktuellen Anpassungen (Support/Resistance,
+Watchlist-Persistenz, Easyfi-Auswahl, Telegram-Alerts) in einer einzigen Datei,
+sodass der komplette Code bei Bedarf einfach kopiert und in Streamlit
+eingesetzt werden kann.
+"""
 
 import base64
 import json
@@ -173,7 +180,7 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
                 return df
         # wenn leer -> gleich Fallback
 
-       # ---------- 2) Binance-Fallback (USDT-Paare) ----------
+    # ---------- 2) Binance-Fallback (USDT-Paare) ----------
     symbol_map = {
         "bitcoin": "BTCUSDT",
         "ethereum": "ETHUSDT",
