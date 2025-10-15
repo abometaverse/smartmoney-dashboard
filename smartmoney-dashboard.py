@@ -27,10 +27,28 @@ import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
 
+try:
+    from streamlit.errors import StreamlitSecretNotFoundError
+except Exception:  # pragma: no cover - fallback for legacy Streamlit
+    class StreamlitSecretNotFoundError(Exception):
+        """Fallback exception mirroring Streamlit's secret error."""
+        pass
+
 # ----------------- App Config -----------------
 st.set_page_config(page_title="Smart Money Dashboard — Geschützt", layout="wide")
 
 # ----------------- Session Helper ------------------
+def get_secret(key: str, default=None):
+    """Safely read a Streamlit secret with a sensible fallback."""
+    try:
+        return st.secrets[key]
+    except (StreamlitSecretNotFoundError, KeyError):
+        return default
+    except Exception:
+        # Accessing secrets outside of a Streamlit runtime raises generic errors.
+        return default
+
+
 def save_state(keys):
     for k in keys:
         if k in st.session_state:
@@ -45,7 +63,7 @@ def restore_state(keys):
 # ----------------- Auth Gate ------------------
 def auth_gate() -> None:
     st.title("🧠 Smart Money Dashboard — Geschützt")
-    secret_pw = st.secrets.get("APP_PASSWORD", None)
+    secret_pw = get_secret("APP_PASSWORD", None)
     if not secret_pw:
         st.error("Konfiguration fehlt: Setze `APP_PASSWORD` unter Settings → Secrets.")
         st.stop()
@@ -328,8 +346,8 @@ def trend_signals(dfd: pd.DataFrame) -> dict:
     return out
 
 def send_telegram(msg: str) -> bool:
-    token = st.secrets.get("TELEGRAM_BOT_TOKEN", None)
-    chat_id = st.secrets.get("TELEGRAM_CHAT_ID", None)
+    token = get_secret("TELEGRAM_BOT_TOKEN", None)
+    chat_id = get_secret("TELEGRAM_CHAT_ID", None)
     if not token or not chat_id:
         return False
     try:
