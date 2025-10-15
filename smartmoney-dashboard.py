@@ -485,6 +485,10 @@ if forced_ids:
 if top_df.empty:
     st.sidebar.warning("Top-Liste konnte nicht geladen werden (API-Limit?). Fallback-Auswahl.")
     default_ids = ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
+    fallback_defaults_source = list(
+        dict.fromkeys((st.session_state["selected_ids"] or default_ids[:3]) + search_ids)
+    )
+    fallback_defaults = [cid for cid in fallback_defaults_source if cid in default_ids]
     selected_labels = st.sidebar.multiselect(
         "Watchlist (Fallback)",
         options=default_ids,
