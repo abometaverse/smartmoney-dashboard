@@ -288,6 +288,27 @@ lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 
 alerts_enabled = st.sidebar.checkbox("Telegram-Alerts aktivieren (Secrets nötig)", value=bool(st.session_state["alerts_enabled"]))
 scan_now = st.sidebar.button("🔔 Watchlist jetzt scannen")
 
+# ----------------- Batching (Sidebar) -----------------
+# Coins pro Durchlauf begrenzen, um API-Limits zu vermeiden
+batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 10, 3, 1)
+
+# Index, ab dem der nächste Scan startet (persistiert in Session)
+st.session_state.setdefault("scan_index", 0)
+st.session_state.setdefault("selected_ids_prev", list(selected_ids))
+
+# Wenn die Watchlist sich ändert, wieder vorne beginnen
+if list(selected_ids) != list(st.session_state["selected_ids_prev"]):
+    st.session_state["scan_index"] = 0
+    st.session_state["selected_ids_prev"] = list(selected_ids)
+
+# Wenn aktiv geklickt wird, springe für den nächsten Run um 'batch_size' weiter
+if scan_now:
+    st.session_state["scan_index"] = (
+        st.session_state["scan_index"] + batch_size
+    ) % max(1, len(selected_ids))
+
+
+
 # ----------------- Batching -----------------
 batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 10, 3, 1)
 st.session_state.setdefault("scan_index", 0)
@@ -329,22 +350,24 @@ if not spot.empty:
 # ----------------- Signals table --------------
 rows, history_cache = [], {}
 
-# Batch-Scanning
+# Batch bestimmen
 start = st.session_state.get("scan_index", 0)
 end = min(start + batch_size, len(selected_ids))
 batch = selected_ids[start:end]
 
 if not batch:
     st.warning("Keine Coins im aktuellen Batch. Starte Scan erneut.")
-    st.stop()
+else:
+    st.info(f"⏳ Scanne Coins {start+1}–{end} von {len(selected_ids)} ...")
 
-st.info(f"⏳ Scanne Coins {start+1}–{end} von {len(selected_ids)} ...")
+# sanfter pausieren zwischen API-Calls
+PAUSE_BETWEEN = 0.5
 
 for cid in batch:
-    time.sleep(0.25)  # Drossel reduziert Rate-Limit-Treffer
+    time.sleep(PAUSE_BETWEEN)
     hist = cg_market_chart(cid, days=days_hist)
 
-    # Status aus Attribut lesen
+    # Status aus Attribut lesen (Diagnose: ok / err:429 / empty / ...)
     status_val = hist.attrs.get("status", "ok") if hist is not None else "no_df"
 
     if hist is None or hist.empty or (status_val != "ok"):
@@ -357,13 +380,13 @@ for cid in batch:
         })
         continue
 
-    # Daten vorbereiten
+    # Daten auf Tagesbasis
     history_cache[cid] = hist
     dfd = hist.copy()
     dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
     dfd = dfd.set_index("timestamp").sort_index().resample("1D").last().dropna()
 
-    # Signale berechnen
+    # Signale
     t_sig = trend_signals(dfd)
     v_sig = volume_signals(dfd)
     resistance, support = calc_local_levels(dfd, lookback=lookback_res)
@@ -386,7 +409,7 @@ for cid in batch:
     })
 
 signals_df = pd.DataFrame(rows)
-st.subheader("🔎 Signals & Levels")
+st.subheader("🔎 Signals & Levels (Batch)")
 
 def _row_style(row):
     # Entry grün, Distribution rot, Breakout gelb
@@ -409,22 +432,30 @@ if not signals_df.empty:
     })
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    # Optional Alerts
+    # Alerts nur für den aktuellen Batch (schont API & deinen Chat)
     if scan_now and alerts_enabled:
         sent = []
         for _, r in signals_df.iterrows():
-            if r["Entry_Signal"]:
+            if r.get("Entry_Signal", False):
                 ok = send_telegram(
                     f"🚨 Entry-Signal: {r['id']} | Preis: ${r['price']:.3f} | "
                     f"Breakout über Widerstand {r['Resistance']:.3f} | Vol-Surge: {r['Vol_Surge_x']:.2f}x"
                 )
                 sent.append((r["id"], ok))
         if not sent:
-            st.info("Keine Entry-Signale.")
+            st.info("Keine Entry-Signale im aktuellen Batch.")
         elif any(ok for _, ok in sent):
-            st.success("Telegram-Alerts gesendet.")
+            st.success("Telegram-Alerts gesendet (Batch).")
         else:
             st.warning("Alert-Versand fehlgeschlagen (prüfe TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
+
+# Hinweis zum Fortschritt
+if len(selected_ids) > 0:
+    if end == len(selected_ids):
+        st.success("✅ Batch-Scan: Ende der Liste erreicht. Nächster Klick startet wieder vorn.")
+    else:
+        nxt_end = min(end + batch_size, len(selected_ids))
+        st.info(f"➡️ Nächster Scan lädt Coins {end+1}–{nxt_end} von {len(selected_ids)}.")
 
 # ----------------- Detail & Tools -------------
 st.markdown("---")
