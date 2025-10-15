@@ -289,24 +289,23 @@ alerts_enabled = st.sidebar.checkbox("Telegram-Alerts aktivieren (Secrets nötig
 scan_now = st.sidebar.button("🔔 Watchlist jetzt scannen")
 
 # ----------------- Batching (Sidebar) -----------------
-# Coins pro Durchlauf begrenzen, um API-Limits zu vermeiden
-batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 10, 3, 1)
+# Eindeutiger key, damit kein DuplicateElementId entsteht
+batch_size = st.sidebar.slider(
+    "Coins pro Scan (Batchgröße)", 2, 10, 3, 1, key="batch_size_slider"
+)
 
-# Index, ab dem der nächste Scan startet (persistiert in Session)
+# Scan-Index persistieren
 st.session_state.setdefault("scan_index", 0)
 st.session_state.setdefault("selected_ids_prev", list(selected_ids))
 
-# Wenn die Watchlist sich ändert, wieder vorne beginnen
+# Watchlist geändert? -> Batch-Zyklus neu starten
 if list(selected_ids) != list(st.session_state["selected_ids_prev"]):
     st.session_state["scan_index"] = 0
     st.session_state["selected_ids_prev"] = list(selected_ids)
 
-# Wenn aktiv geklickt wird, springe für den nächsten Run um 'batch_size' weiter
-if scan_now:
-    st.session_state["scan_index"] = (
-        st.session_state["scan_index"] + batch_size
-    ) % max(1, len(selected_ids))
-
+# Optional: Batch zurücksetzen
+if st.sidebar.button("🔁 Batch zurücksetzen", key="reset_batch_btn"):
+    st.session_state["scan_index"] = 0
 
 
 # ----------------- Batching -----------------
