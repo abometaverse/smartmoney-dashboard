@@ -20,48 +20,17 @@ eingesetzt werden kann.
 import base64
 import json
 import math
-import os
 import time
-from typing import Any, Optional
-
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 import streamlit as st
 
 # ----------------- App Config -----------------
 st.set_page_config(page_title="Smart Money Dashboard — Geschützt", layout="wide")
 
 # ----------------- Session Helper ------------------
-def get_secret(key: str, default: Optional[Any] = None) -> Optional[Any]:
-    """Safely access Streamlit secrets with graceful fallbacks.
-
-    Streamlit raises ``StreamlitSecretNotFoundError`` when no secrets are
-    configured. This helper shields the app from that crash and optionally
-    falls back to environment variables, which is convenient for local
-    development or running the script outside of Streamlit.
-    """
-
-    try:
-        secrets_obj = st.secrets
-    except Exception:  # pragma: no cover - streamlit raises custom errors
-        secrets_obj = {}
-
-    value: Optional[Any]
-    if isinstance(secrets_obj, dict):
-        value = secrets_obj.get(key, default)
-    else:
-        try:
-            value = secrets_obj.get(key, default)  # type: ignore[attr-defined]
-        except Exception:  # pragma: no cover - streamlit secrets edge cases
-            value = default
-
-    if value is None:
-        value = os.environ.get(key, default)
-    return value
-
-
 def save_state(keys):
     for k in keys:
         if k in st.session_state:
@@ -76,7 +45,7 @@ def restore_state(keys):
 # ----------------- Auth Gate ------------------
 def auth_gate() -> None:
     st.title("🧠 Smart Money Dashboard — Geschützt")
-    secret_pw = get_secret("APP_PASSWORD")
+    secret_pw = st.secrets.get("APP_PASSWORD", None)
     if not secret_pw:
         st.error("Konfiguration fehlt: Setze `APP_PASSWORD` unter Settings → Secrets.")
         st.stop()
@@ -359,8 +328,8 @@ def trend_signals(dfd: pd.DataFrame) -> dict:
     return out
 
 def send_telegram(msg: str) -> bool:
-    token = get_secret("TELEGRAM_BOT_TOKEN")
-    chat_id = get_secret("TELEGRAM_CHAT_ID")
+    token = st.secrets.get("TELEGRAM_BOT_TOKEN", None)
+    chat_id = st.secrets.get("TELEGRAM_CHAT_ID", None)
     if not token or not chat_id:
         return False
     try:
