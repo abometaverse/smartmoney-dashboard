@@ -307,25 +307,6 @@ if list(selected_ids) != list(st.session_state["selected_ids_prev"]):
 if st.sidebar.button("🔁 Batch zurücksetzen", key="reset_batch_btn"):
     st.session_state["scan_index"] = 0
 
-
-# ----------------- Batching -----------------
-batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 10, 3, 1)
-st.session_state.setdefault("scan_index", 0)
-
-if scan_now:
-    # Index erhöhen für nächsten Scan
-    st.session_state["scan_index"] = (st.session_state["scan_index"] + batch_size) % max(1, len(selected_ids))
-
-# in Session ablegen (für Persistenz)
-st.session_state["selected_ids"] = selected_ids
-st.session_state["min_mktcap"]   = min_mktcap
-st.session_state["min_volume"]   = min_volume
-st.session_state["vol_surge_thresh"] = vol_surge_thresh
-st.session_state["lookback_res"] = lookback_res
-st.session_state["alerts_enabled"] = alerts_enabled
-
-st.caption("🔒 Passwortschutz aktiv — setze `APP_PASSWORD` in Streamlit Secrets.  •  Alerts via Telegram (optional).")
-
 # ----------------- Checklist ------------------
 with st.expander("📋 Tägliche Checkliste", expanded=False):
     st.markdown("""
