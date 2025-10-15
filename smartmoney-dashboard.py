@@ -269,7 +269,7 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
         df["price"]     = pd.to_numeric(df["close"], errors="coerce")
         df["volume"]    = pd.to_numeric(df["volume"], errors="coerce")
         df = df[["timestamp","price","volume"]].dropna()
-        if df.empty:
+        if df.empty():
             return _empty("empty_binance")
         df = df.sort_values("timestamp").tail(int(days)+1)
         df.attrs["status"] = "ok_binance"
@@ -485,19 +485,14 @@ if forced_ids:
 if top_df.empty:
     st.sidebar.warning("Top-Liste konnte nicht geladen werden (API-Limit?). Fallback-Auswahl.")
     default_ids = ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
-    stored_selection = st.session_state.get("selected_ids") or []
-    stored_selection = [cid for cid in stored_selection if isinstance(cid, str)]
-    base_defaults = stored_selection or default_ids[:3]
-    candidate_defaults = base_defaults + [cid for cid in search_ids if isinstance(cid, str)]
-
-    fallback_defaults: list[str] = []
-    for cid in candidate_defaults:
-        if cid in default_ids and cid not in fallback_defaults:
-            fallback_defaults.append(cid)
+    fallback_defaults_source = list(
+        dict.fromkeys((st.session_state["selected_ids"] or default_ids[:3]) + search_ids)
+    )
+    fallback_defaults = [cid for cid in fallback_defaults_source if cid in default_ids]
     selected_labels = st.sidebar.multiselect(
         "Watchlist (Fallback)",
         options=default_ids,
-        default=fallback_defaults,
+        default=list(dict.fromkeys((st.session_state["selected_ids"] or default_ids[:3]) + search_ids)),
         key="watchlist_fallback"
     )
     selected_ids = selected_labels
@@ -569,9 +564,9 @@ st.caption("🔒 Passwortschutz aktiv — setze `APP_PASSWORD` in Secrets.  • 
 
 # ----------------- Checklist ------------------
 with st.expander("📋 Tägliche Checkliste", expanded=False):
-    st.markdown("""
-**Morgens:** Scan → Kandidaten (Breakout + Vol-Surge) notieren, Funding/TVL querprüfen  
-**Mittags:** Entry nur bei Preis > MA20 > MA50 **und** Vol-Surge ≥ Schwelle **und** Breakout über Widerstand  
+    st.markdown("""\
+**Morgens:** Scan → Kandidaten (Breakout + Vol-Surge) notieren, Funding/TVL querprüfen
+**Mittags:** Entry nur bei Preis > MA20 > MA50 **und** Vol-Surge ≥ Schwelle **und** Breakout über Widerstand
 **Abends:** Volumen-Trend prüfen, Trailing Stop nachziehen, Teilgewinne sichern
 """)
 
