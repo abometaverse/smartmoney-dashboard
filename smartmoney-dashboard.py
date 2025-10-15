@@ -175,12 +175,9 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
     symbol_map = {
         "bitcoin": "BTCUSDT",
         "ethereum": "ETHUSDT",
-        "solana": "SOLUSDT",
-        "arbitrum": "ARBUSDT",
-        "render-token": "RNDRUSDT",
-        "bittensor": "TAOUSDT",
-        # raydium kommt i. d. R. generisch über Top-500 Mapping -> "RAYUSDT"
+        "solana": "SOLUSDT",  
     }
+    
     sym = symbol_map.get(coin_id)
     if not sym:
         try:
@@ -560,3 +557,49 @@ if coin_select:
 
     # optional Quelle anzeigen
     st.caption(f"Datenquelle: {str(status_val).replace('ok_', '')}")
+
+    df = d.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
+    if df.empty:
+        st.warning("Keine validen Datenpunkte für das Chart gefunden.")
+        st.stop()
+
+    daily = df.set_index("timestamp").resample("1D").last().dropna(subset=["price"])
+    daily["ma20"] = ma(daily["price"], 20)
+    daily["ma50"] = ma(daily["price"], 50)
+
+    col_chart, col_trail = st.columns([3, 1])
+
+    with col_chart:
+        fig, ax_price = plt.subplots(figsize=(10, 5))
+        ax_price.plot(daily.index, daily["price"], label="Preis", color="#1f77b4", linewidth=2)
+        if daily["ma20"].notna().any():
+            ax_price.plot(daily.index, daily["ma20"], label="MA20", color="#ff7f0e", linestyle="--")
+        if daily["ma50"].notna().any():
+            ax_price.plot(daily.index, daily["ma50"], label="MA50", color="#2ca02c", linestyle=":")
+        ax_price.set_ylabel("Preis (USD)")
+        ax_price.grid(True, linestyle=":", alpha=0.4)
+
+        ax_vol = ax_price.twinx()
+        ax_vol.bar(daily.index, daily["volume"], label="Volumen", color="#bbbbbb", alpha=0.4)
+        ax_vol.set_ylabel("Volumen")
+
+        handles, labels = ax_price.get_legend_handles_labels()
+        if handles:
+            ax_price.legend(handles, labels, loc="upper left")
+        fig.autofmt_xdate()
+        st.pyplot(fig, clear_figure=True)
+
+    with col_trail:
+        trail_pct = st.slider("Trailing Stop (%)", min_value=2, max_value=30, value=10, step=1)
+        lookback_window = min(lookback_res, len(daily))
+        if lookback_window > 0:
+            window_slice = daily["price"].iloc[-lookback_window:]
+            recent_high = float(window_slice.max())
+            stop_level = trailing_stop(recent_high, trail_pct)
+            st.metric("Trailing Stop", f"${stop_level:,.2f}")
+        else:
+            st.metric("Trailing Stop", "–")
+
+    st.caption("Preis (Linie) mit MA20/MA50 und Volumen (Balken). Rechts: dynamischer Trailing Stop auf Basis des Lookbacks.")
