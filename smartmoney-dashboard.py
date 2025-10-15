@@ -544,34 +544,19 @@ coin_select = st.selectbox(
 
 if coin_select:
     d = st.session_state.get("history_cache", {}).get(coin_select)
+    # Falls nicht im Batch geladen: jetzt einmalig nachladen
     if d is None or d.empty:
-        # Nur nachladen, wenn ausdrücklich Coin gewechselt wurde (kein Massenscan)
         d = cg_market_chart(coin_select, days=st.session_state["days_hist"])
-    if d is None or d.empty or (d.attrs.get("status","ok") != "ok"):
+        if isinstance(d, pd.DataFrame) and not d.empty:
+            # im Session-Cache ablegen, damit bei erneutem Öffnen kein zweiter Call nötig ist
+            st.session_state.setdefault("history_cache", {})
+            st.session_state["history_cache"][coin_select] = d
+
+    # Status akzeptiert "ok", "ok_cg", "ok_binance"
+    status_val = (d.attrs.get("status", "") if isinstance(d, pd.DataFrame) else "")
+    if d is None or d.empty or (not str(status_val).startswith("ok")):
         st.warning("Keine Historie verfügbar (API-Limit oder leere Daten).")
-    else:
-        dfd = d.copy()
-        dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
-        dfd = dfd.set_index("timestamp").sort_index().resample("1D").last().dropna()
+        st.stop()
 
-        r, s = calc_local_levels(dfd, lookback=lookback_res)
-        v_sig = volume_signals(dfd)
-
-        fig, ax = plt.subplots()
-        ax.plot(dfd.index, dfd["price"], label="Price")
-        ax.plot(dfd.index, ma(dfd["price"],20), label="MA20")
-        ax.plot(dfd.index, ma(dfd["price"],50), label="MA50")
-        if not np.isnan(r): ax.axhline(r, linestyle="--", label=f"Resistance {r:.3f}")
-        if not np.isnan(s): ax.axhline(s, linestyle="--", label=f"Support {s:.3f}")
-        ax.set_title(f"{coin_select} — Price & Levels"); ax.set_xlabel("Date"); ax.set_ylabel("USD"); ax.legend()
-        st.pyplot(fig, use_container_width=True)
-
-        fig2, ax2 = plt.subplots()
-        ax2.bar(dfd.index, dfd["volume"])
-        ax2.set_title(f"{coin_select} — Daily Volume"); ax2.set_xlabel("Date"); ax2.set_ylabel("USD")
-        st.pyplot(fig2, use_container_width=True)
-
-        if v_sig["distribution_risk"]:
-            st.warning("Distribution-Risk: Preis ↑ bei Volumen < 0.8× 7d-Ø.")
-        else:
-            st.success("Volumen ok (keine Distribution-Anzeichen).")
+    # optional Quelle anzeigen
+    st.caption(f"Datenquelle: {str(status_val).replace('ok_', '')}")
