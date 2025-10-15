@@ -171,7 +171,7 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
                 return df
         # wenn leer -> gleich Fallback
 
-    # ---------- 2) Binance-Fallback (USDT-Paare) ----------
+       # ---------- 2) Binance-Fallback (USDT-Paare) ----------
     symbol_map = {
         "bitcoin": "BTCUSDT",
         "ethereum": "ETHUSDT",
@@ -179,29 +179,47 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
         "arbitrum": "ARBUSDT",
         "render-token": "RNDRUSDT",
         "bittensor": "TAOUSDT",
+        # raydium kommt i. d. R. generisch über Top-500 Mapping -> "RAYUSDT"
     }
     sym = symbol_map.get(coin_id)
     if not sym:
-        # generisch: versuche Symbol aus Top500
         try:
             top = cg_top_coins(limit=500)
             sym = top.loc[top["id"] == coin_id, "symbol"].str.upper().iloc[0] + "USDT"
         except Exception:
             return _empty("no_symbol")
 
-    r = get_http().get(
+    # versuche mehrere Binance-Hosts, falls 451/403
+    BINANCE_KLINES_ENDPOINTS = [
         "https://api.binance.com/api/v3/klines",
-        params={"symbol": sym, "interval": "1d", "limit": min(1000, int(days)+5)},
-        timeout=10
-    )
-    if r.status_code != 200:
-        return _empty(f"err_binance:{r.status_code}")
+        "https://data-api.binance.vision/api/v3/klines",
+        "https://api.binance.us/api/v3/klines",
+    ]
+
+    last_status = None
+    klines_json = None
+    for base in BINANCE_KLINES_ENDPOINTS:
+        r = get_http().get(
+            base,
+            params={"symbol": sym, "interval": "1d", "limit": min(1000, int(days)+5)},
+            timeout=8
+        )
+        last_status = r.status_code
+        if r.status_code == 200:
+            try:
+                klines_json = r.json()
+            except Exception:
+                klines_json = None
+            if klines_json:
+                break
+        # bei 451/403/5xx einfach nächsten Host probieren
+        time.sleep(0.3)
+
+    if not klines_json:
+        return _empty(f"err_binance:{last_status}")
 
     try:
-        kl = r.json()
-        if not kl:
-            return _empty("empty_binance")
-        df = pd.DataFrame(kl, columns=[
+        df = pd.DataFrame(klines_json, columns=[
             "openTime","open","high","low","close","volume",
             "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
         ])
