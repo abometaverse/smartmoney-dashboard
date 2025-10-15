@@ -90,7 +90,7 @@ def get_http() -> requests.Session:
     return s
 
 # ----------------- HTTP helper (robust + Diagnose) -------
-def _get_json(url, params=None, timeout=40, retries=6, backoff=2.0):
+def _get_json(url, params=None, timeout=40, retries=7, backoff=2.2):
     """HTTP GET mit Retry/Backoff. Rückgabe: dict mit ok/json/status/error."""
     session = get_http()
     last_err = ""
@@ -135,32 +135,80 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
-    """Historische Preise/Volumen. Bei API-Fehler -> leerer DF mit df.attrs['status'] != 'ok'."""
-    resp = _get_json(
-        f"{CG_BASE}/coins/{coin_id}/market_chart",
-        {"vs_currency": FIAT, "days": days, "interval": "daily"}
-    )
-
+    """Historische Preise/Volumen von CoinGecko, mit Fallback auf Binance für Majors."""
     def _empty(status_text: str) -> pd.DataFrame:
         df = pd.DataFrame(columns=["timestamp", "price", "volume"])
         df.attrs["status"] = status_text
         return df
 
-    if not resp.get("ok"):
-        return _empty(f"err:{resp.get('status')}")
-    data = resp["json"]
-    prices = data.get("prices", [])
-    vols   = data.get("total_volumes", [])
-    if not prices:
-        return _empty("empty")
+    # 1) Erst CoinGecko versuchen
+    resp = _get_json(
+        f"{CG_BASE}/coins/{coin_id}/market_chart",
+        {"vs_currency": FIAT, "days": days, "interval": "daily"}
+    )
+    if resp.get("ok"):
+        data = resp["json"]
+        prices = data.get("prices", [])
+        vols   = data.get("total_volumes", [])
+        if prices:
+            dfp = pd.DataFrame(prices, columns=["ts","price"])
+            dfv = pd.DataFrame(vols,    columns=["ts","volume"])
+            df  = dfp.merge(dfv, on="ts", how="left")
+            df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True, errors="coerce")
+            df = df[["timestamp","price","volume"]].dropna()
+            if not df.empty:
+                df.attrs["status"] = "ok_cg"
+                return df
+        # sonst fällt es unten auf Binance zurück
 
-    dfp = pd.DataFrame(prices, columns=["ts","price"])
-    dfv = pd.DataFrame(vols,    columns=["ts","volume"])
-    df = dfp.merge(dfv, on="ts", how="left")
-    df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True, errors="coerce")
-    df = df[["timestamp","price","volume"]].dropna()
-    df.attrs["status"] = "ok"
-    return df
+    # 2) Fallback: Binance-Klines (nur Majors/USDT-Paare)
+    symbol_map = {
+        "bitcoin": "BTCUSDT",
+        "ethereum": "ETHUSDT",
+        "solana": "SOLUSDT",
+        "arbitrum": "ARBUSDT",
+        "render-token": "RNDRUSDT",
+        "bittensor": "TAOUSDT",
+    }
+    sym = symbol_map.get(coin_id)
+    if not sym:
+        # generischer Versuch aus Symbol (falls Top500 geladen)
+        try:
+            top = cg_top_coins(limit=500)
+            sym_guess = top.loc[top["id"] == coin_id, "symbol"].str.upper().iloc[0] + "USDT"
+            sym = sym_guess
+        except Exception:
+            return _empty(f"err:{resp.get('status') if resp else 'no_cg'}")
+
+    # Binance liefert OHLCV; wir nehmen Close & Volume
+    # max 1000 candles/Call; 1d * days passt
+    r = get_http().get("https://api.binance.com/api/v3/klines",
+                       params={"symbol": sym, "interval": "1d", "limit": min(1000, int(days)+5)},
+                       timeout=30)
+    if r.status_code != 200:
+        return _empty(f"err_binance:{r.status_code}")
+
+    try:
+        kl = r.json()
+        if not kl:
+            return _empty("empty_binance")
+        # Kline: [openTime, open, high, low, close, volume, ...]
+        df = pd.DataFrame(kl, columns=[
+            "openTime","open","high","low","close","volume",
+            "closeTime","qav","numTrades","takerBase","takerQuote","ignore"
+        ])
+        df["timestamp"] = pd.to_datetime(df["openTime"], unit="ms", utc=True, errors="coerce")
+        df["price"]     = pd.to_numeric(df["close"], errors="coerce")
+        df["volume"]    = pd.to_numeric(df["volume"], errors="coerce")
+        df = df[["timestamp","price","volume"]].dropna()
+        if df.empty:
+            return _empty("empty_binance")
+        # Bei Bedarf kürzen auf gewünschte Tage
+        df = df.sort_values("timestamp").tail(int(days)+1)
+        df.attrs["status"] = "ok_binance"
+        return df
+    except Exception:
+        return _empty("parse_binance")
 
 @st.cache_data(ttl=600, show_spinner=False)
 def cg_simple_price(ids) -> pd.DataFrame:
@@ -238,7 +286,7 @@ for k, v in {
     "vol_surge_thresh": 1.5,
     "lookback_res": 20,
     "alerts_enabled": True,
-    "days_hist": 120,            # etwas niedriger als vorher
+    "days_hist": 60,            # etwas niedriger als vorher
     "batch_size_slider": 3,
     "scan_index": 0
 }.items():
@@ -342,7 +390,7 @@ def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res
         return pd.DataFrame(), {}, start, end
 
     st.info(f"⏳ Scanne Coins {start+1}–{end} von {len(selected_ids)} ...")
-    PAUSE_BETWEEN = 0.5  # sanfte Rate-Limitierung
+    PAUSE_BETWEEN = 0.6  # sanfte Rate-Limitierung
 
     for cid in batch:
         time.sleep(PAUSE_BETWEEN)
@@ -380,6 +428,7 @@ def run_scan(selected_ids, days_hist, batch_size, vol_surge_thresh, lookback_res
             "Breakout_Resistance": breakout_res,
             "Distribution_Risk": v_sig["distribution_risk"],
             "Entry_Signal": entry_ok and breakout_res, "status": "ok"
+            "source": status_val  # zeigt err/empty an
         })
 
     signals_df = pd.DataFrame(rows)
