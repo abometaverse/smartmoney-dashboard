@@ -245,7 +245,7 @@ for k, v in {
     st.session_state.setdefault(k, v)
 
 days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15, key="days_hist")
-st.session_state["days_hist"] = days_hist
+# NICHT erneut in session_state schreiben – der Slider pflegt key="days_hist" selbst
 
 # Watchlist
 top_df = cg_top_coins(limit=500)
