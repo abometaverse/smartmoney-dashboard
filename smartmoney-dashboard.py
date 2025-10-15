@@ -9,7 +9,16 @@
 # TELEGRAM_BOT_TOKEN = "123:abc"   # optional
 # TELEGRAM_CHAT_ID   = "123456789" # optional
 # -------------------------------------------------------------
+"""Smart Money Dashboard.
 
+Dieses Skript bündelt alle aktuellen Anpassungen (Support/Resistance,
+Watchlist-Persistenz, Easyfi-Auswahl, Telegram-Alerts) in einer einzigen Datei,
+sodass der komplette Code bei Bedarf einfach kopiert und in Streamlit
+eingesetzt werden kann.
+"""
+
+import base64
+import json
 import math
 import time
 import requests
@@ -171,13 +180,16 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
                 return df
         # wenn leer -> gleich Fallback
 
-       # ---------- 2) Binance-Fallback (USDT-Paare) ----------
+    # ---------- 2) Binance-Fallback (USDT-Paare) ----------
     symbol_map = {
         "bitcoin": "BTCUSDT",
         "ethereum": "ETHUSDT",
-        "solana": "SOLUSDT",  
+        "solana": "SOLUSDT",
+        "arbitrum": "ARBUSDT",
+        "render-token": "RNDRUSDT",
+        "bittensor": "TAOUSDT",
+        # raydium kommt i. d. R. generisch über Top-500 Mapping -> "RAYUSDT"
     }
-    
     sym = symbol_map.get(coin_id)
     if not sym:
         try:
@@ -297,6 +309,60 @@ def send_telegram(msg: str) -> bool:
 def trailing_stop(current_high: float, trail_pct: float) -> float:
     return current_high * (1 - trail_pct/100.0)
 
+# ----------------- Persistenz (Mobile/iPhone) --------------------
+PERSIST_KEYS = [
+    "selected_ids",
+    "min_mktcap",
+    "min_volume",
+    "vol_surge_thresh",
+    "lookback_res",
+    "alerts_enabled",
+    "days_hist",
+    "batch_size_slider",
+]
+
+
+def _decode_state(param_value: str) -> dict:
+    try:
+        raw = base64.urlsafe_b64decode(param_value.encode("utf-8"))
+        data = json.loads(raw.decode("utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _encode_state(state: dict) -> str:
+    raw = json.dumps(state, sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8")
+
+
+def load_persisted_state() -> None:
+    params = st.experimental_get_query_params()
+    encoded = params.get("state", [None])[0]
+    if not encoded:
+        return
+    data = _decode_state(encoded)
+    if not data:
+        return
+    for k in PERSIST_KEYS:
+        if k in data:
+            st.session_state.setdefault(k, data[k])
+    st.session_state["_persisted_state"] = params.get("state", [None])[0]
+
+
+def persist_state() -> None:
+    state = {k: st.session_state.get(k) for k in PERSIST_KEYS}
+    encoded = _encode_state(state)
+    if st.session_state.get("_persisted_state") == encoded:
+        return
+    st.experimental_set_query_params(state=encoded)
+    st.session_state["_persisted_state"] = encoded
+
+
+load_persisted_state()
+
 # ----------------- Sidebar --------------------
 st.sidebar.header("Settings")
 
@@ -318,7 +384,26 @@ days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["
 # NICHT erneut in session_state schreiben – der Slider pflegt key="days_hist" selbst
 
 # Watchlist
+ensure_ids = {"easy": "easyfi", "easyfi": "easyfi"}
 top_df = cg_top_coins(limit=500)
+
+forced_ids = list({ensure_ids.get(cid, cid) for cid in st.session_state.get("selected_ids", []) if cid})
+forced_ids.append("easyfi")
+forced_ids = sorted(set(filter(None, forced_ids)))
+
+if forced_ids:
+    extra = cg_simple_price(forced_ids)
+    if not extra.empty:
+        extra = extra[["id", "symbol", "name", "market_cap"]].drop_duplicates(subset=["id"])
+        if top_df.empty:
+            top_df = extra
+        else:
+            top_df = (
+                pd.concat([top_df, extra], ignore_index=True)
+                .drop_duplicates(subset=["id"])
+                .reset_index(drop=True)
+            )
+
 if top_df.empty:
     st.sidebar.warning("Top-Liste konnte nicht geladen werden (API-Limit?). Fallback-Auswahl.")
     default_ids = ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
@@ -331,7 +416,15 @@ if top_df.empty:
     selected_ids = selected_labels
 else:
     top_df["label"] = top_df.apply(lambda r: f"{r['name']} ({str(r['symbol']).upper()}) — {r['id']}", axis=1)
-    default_ids = st.session_state["selected_ids"] or ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
+    default_ids = st.session_state["selected_ids"] or [
+        "bitcoin",
+        "ethereum",
+        "solana",
+        "arbitrum",
+        "render-token",
+        "bittensor",
+        "easyfi",
+    ]
     default_labels = top_df[top_df["id"].isin(default_ids)]["label"].tolist()
     selected_labels = st.sidebar.multiselect(
         "Watchlist auswählen (Top 500, Suche per Tippen)",
@@ -342,10 +435,12 @@ else:
     )
     label_to_id = dict(zip(top_df["label"], top_df["id"]))
     selected_ids = [label_to_id[l] for l in selected_labels]
+    selected_ids = [ensure_ids.get(cid, cid) for cid in selected_ids]
 
 manual = st.sidebar.text_input("Zusätzliche ID (optional)", value="", key="manual_id")
 if manual.strip():
-    selected_ids.append(manual.strip())
+    selected_ids.append(ensure_ids.get(manual.strip(), manual.strip()))
+selected_ids = list(dict.fromkeys(selected_ids))
 if not selected_ids:
     selected_ids = ["bitcoin","ethereum"]
 
@@ -371,13 +466,15 @@ st.session_state["vol_surge_thresh"] = vol_surge_thresh
 st.session_state["lookback_res"] = lookback_res
 st.session_state["alerts_enabled"] = alerts_enabled
 
+persist_state()
+
 st.caption("🔒 Passwortschutz aktiv — setze `APP_PASSWORD` in Secrets.  •  Alerts via Telegram (optional).  •  Scans laufen nur auf Klick (Compute-on-Click).")
 
 # ----------------- Checklist ------------------
 with st.expander("📋 Tägliche Checkliste", expanded=False):
-    st.markdown("""
-**Morgens:** Scan → Kandidaten (Breakout + Vol-Surge) notieren, Funding/TVL querprüfen  
-**Mittags:** Entry nur bei Preis > MA20 > MA50 **und** Vol-Surge ≥ Schwelle **und** Breakout über Widerstand  
+    st.markdown("""\
+**Morgens:** Scan → Kandidaten (Breakout + Vol-Surge) notieren, Funding/TVL querprüfen
+**Mittags:** Entry nur bei Preis > MA20 > MA50 **und** Vol-Surge ≥ Schwelle **und** Breakout über Widerstand
 **Abends:** Volumen-Trend prüfen, Trailing Stop nachziehen, Teilgewinne sichern
 """)
 
@@ -568,6 +665,8 @@ if coin_select:
     daily = df.set_index("timestamp").resample("1D").last().dropna(subset=["price"])
     daily["ma20"] = ma(daily["price"], 20)
     daily["ma50"] = ma(daily["price"], 50)
+    lookback_val = int(st.session_state.get("lookback_res", lookback_res))
+    resistance_lvl, support_lvl = calc_local_levels(daily.reset_index(drop=True), lookback=lookback_val)
 
     col_chart, col_trail = st.columns([3, 1])
 
@@ -578,6 +677,22 @@ if coin_select:
             ax_price.plot(daily.index, daily["ma20"], label="MA20", color="#ff7f0e", linestyle="--")
         if daily["ma50"].notna().any():
             ax_price.plot(daily.index, daily["ma50"], label="MA50", color="#2ca02c", linestyle=":")
+        if not math.isnan(resistance_lvl):
+            ax_price.axhline(
+                resistance_lvl,
+                color="#d62728",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"Resistance ({lookback_val}d)",
+            )
+        if not math.isnan(support_lvl):
+            ax_price.axhline(
+                support_lvl,
+                color="#17becf",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"Support ({lookback_val}d)",
+            )
         ax_price.set_ylabel("Preis (USD)")
         ax_price.grid(True, linestyle=":", alpha=0.4)
 
@@ -592,8 +707,12 @@ if coin_select:
         st.pyplot(fig, clear_figure=True)
 
     with col_trail:
+        res_text = f"${resistance_lvl:,.2f}" if not math.isnan(resistance_lvl) else "–"
+        sup_text = f"${support_lvl:,.2f}" if not math.isnan(support_lvl) else "–"
+        st.metric("Resistance", res_text, help=f"Berechnet aus den letzten {lookback_val} Tagen (ohne aktuelle Kerze).")
+        st.metric("Support", sup_text, help=f"Berechnet aus den letzten {lookback_val} Tagen (ohne aktuelle Kerze).")
         trail_pct = st.slider("Trailing Stop (%)", min_value=2, max_value=30, value=10, step=1)
-        lookback_window = min(lookback_res, len(daily))
+        lookback_window = min(lookback_val, len(daily))
         if lookback_window > 0:
             window_slice = daily["price"].iloc[-lookback_window:]
             recent_high = float(window_slice.max())
@@ -602,4 +721,6 @@ if coin_select:
         else:
             st.metric("Trailing Stop", "–")
 
-    st.caption("Preis (Linie) mit MA20/MA50 und Volumen (Balken). Rechts: dynamischer Trailing Stop auf Basis des Lookbacks.")
+    st.caption(
+        "Preis (Linie) mit MA20/MA50, Widerstand/Support (Lookback) sowie Volumen (Balken). Rechts: Levels und dynamischer Trailing Stop."
+    )
