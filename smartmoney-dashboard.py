@@ -1,9 +1,10 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
-# Smart Money Dashboard — Binance only
-# v4.0: Datenquellen 100% Binance (Top100, Preise, Historie),
-#       AgGrid Row-Click, Batch-Scan, MA20/MA50, R/S, Entry-Punkte,
-#       tausender-Trennzeichen, kompakte Zahlen, Telegram optional.
+# Smart Money Dashboard — Binance only (robust)
+# v4.1: Fix KeyError bei leerem Top100 (Fallback/Spalten),
+#       Binance-only Daten, AgGrid Row-Click, Batch-Scan,
+#       MA20/MA50, Widerstand/Support, Entry-Punkte,
+#       Tausender-Trennzeichen & kompakte Zahlen.
 #
 # Secrets (Streamlit → Advanced settings → Secrets):
 # APP_PASSWORD        = "DeinStarkesPasswort"
@@ -13,7 +14,7 @@
 
 import math
 import time
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 
 import requests
 import pandas as pd
@@ -84,7 +85,7 @@ auth_gate()
 @st.cache_resource(show_spinner=False)
 def http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/4.0 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/4.1 (+streamlit)"})
     ad = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
     s.mount("https://", ad); s.mount("http://", ad)
     return s
@@ -96,7 +97,6 @@ def _get(url, params=None, timeout=10, retries=2, backoff=1.6) -> Dict:
             r = http().get(url, params=params, timeout=timeout)
             if r.status_code == 200:
                 return {"ok": True, "json": r.json(), "status": 200}
-            # 400/403/451/5xx sauber behandeln
             last = f"HTTP {r.status_code}"
             if r.status_code in (429, 451, 403, 502, 503, 504):
                 time.sleep(backoff*(i+1)); continue
@@ -125,7 +125,8 @@ BINANCE = "https://api.binance.com"
 @st.cache_data(ttl=600, show_spinner=True)
 def binance_exchange_info() -> pd.DataFrame:
     r = _get(f"{BINANCE}/api/v3/exchangeInfo")
-    if not r.get("ok"): return pd.DataFrame(columns=["symbol","baseAsset","quoteAsset","status"])
+    if not r.get("ok"): 
+        return pd.DataFrame(columns=["symbol","baseAsset","quoteAsset","status"])
     d = pd.DataFrame(r["json"]["symbols"])
     return d[["symbol","baseAsset","quoteAsset","status"]]
 
@@ -136,7 +137,10 @@ def binance_top100_usdt() -> pd.DataFrame:
     Filtert Leveraged/DOWN/UP/.*BULL/BEAR usw.
     """
     r = _get(f"{BINANCE}/api/v3/ticker/24hr")
-    if not r.get("ok"): return pd.DataFrame()
+    if not r.get("ok"):
+        # Leeres, ABER mit erwarteten Spalten -> verhindert KeyError downstream
+        return pd.DataFrame(columns=["coin_id","symbol","baseAsset","name","label","lastPrice","volume","quoteVolume"])
+
     t = pd.DataFrame(r["json"])
     # nur USDT-Spot
     t = t[t["symbol"].str.endswith("USDT")].copy()
@@ -150,13 +154,16 @@ def binance_top100_usdt() -> pd.DataFrame:
 
     ex = binance_exchange_info()
     if ex.empty: 
-        # fallback: base = symbol[:-4]
         t["baseAsset"] = t["symbol"].str.replace("USDT","", regex=False)
         t["name"] = t["baseAsset"]
     else:
         m = ex.set_index("symbol")[["baseAsset","quoteAsset"]]
-        t["baseAsset"] = t["symbol"].map(lambda s: m.loc[s,"baseAsset"] if s in m.index else s.replace("USDT",""))
-        t["quoteAsset"] = t["symbol"].map(lambda s: m.loc[s,"quoteAsset"] if s in m.index else "USDT")
+        def _base(sym):
+            return m.loc[sym,"baseAsset"] if sym in m.index else sym.replace("USDT","")
+        def _quote(sym):
+            return m.loc[sym,"quoteAsset"] if sym in m.index else "USDT"
+        t["baseAsset"] = t["symbol"].map(_base)
+        t["quoteAsset"] = t["symbol"].map(_quote)
         t["name"] = t["baseAsset"]
 
     t["coin_id"] = t["baseAsset"].str.lower()   # interne ID
@@ -171,7 +178,7 @@ def binance_top100_usdt() -> pd.DataFrame:
 def binance_klines_usdt(base_asset: str, days: int = 180) -> pd.DataFrame:
     """
     Holt 1d-Kerzen für BASEUSDT. Probiert mehrere Endpunkte; 400/403/451/5xx werden
-    sauber abgefangen. Rückgabe: df(timestamp, price, volume) mit attrs: status='ok'
+    abgefangen. Rückgabe: df(timestamp, price, volume) mit attrs: status='ok'
     """
     if not base_asset: 
         df = pd.DataFrame(columns=["timestamp","price","volume"]); df.attrs["status"] = "no_symbol"; return df
@@ -272,8 +279,12 @@ st.caption("🔒 Passwortschutz aktiv • Quelle: **Binance** (Top100, Preise, H
 
 # ----------------- Universe / Snapshot -----------------
 top100 = binance_top100_usdt()
+
+# Falls leer → Dummy-Spalten + Hinweis (verhindert KeyError downstream)
 if top100.empty:
-    st.error("Konnte Binance Top-100 nicht laden.")
+    st.warning("Konnte Binance Top-100 nicht laden (Rate-Limit/Netzwerk). Fallback aktiv.")
+    top100 = pd.DataFrame(columns=["coin_id","symbol","baseAsset","name","label","lastPrice","volume","quoteVolume"])
+
 else:
     st.subheader("📊 Snapshot Top-100 (Binance, nach QuoteVolume)")
     disp = top100.copy()
@@ -284,12 +295,14 @@ else:
     st.dataframe(disp[["Coin","Price","Vol","QuoteVol","coin_id","symbol"]], use_container_width=True, hide_index=True)
 
 # ----------------- Watchlist -----------------
-watchlist = []
+watchlist: List[str] = []
 if st.session_state["watchlist_manual"].strip():
     watchlist = [a.strip().upper() for a in st.session_state["watchlist_manual"].split(",") if a.strip()]
-else:
-    # Default: nimm die Top100 BaseAssets (praktisch zum Start)
+elif not top100.empty and "baseAsset" in top100.columns:
     watchlist = top100["baseAsset"].head(10).tolist()
+else:
+    # Harter Fallback – verhindert KeyError
+    watchlist = ["BTC", "ETH", "SOL"]
 
 # ----------------- Signals Cache -----------------
 if "signals_cache" not in st.session_state: st.session_state["signals_cache"] = pd.DataFrame()
@@ -368,8 +381,8 @@ signals = st.session_state["signals_cache"].copy()
 st.subheader("🔎 Signals & Levels (Watchlist)")
 
 if not signals.empty:
-    # join mit Snapshot für Label
-    lbl = top100.set_index("baseAsset")["label"].to_dict()
+    # join mit Snapshot für Label (sofern vorhanden)
+    lbl = (top100.set_index("baseAsset")["label"].to_dict() if ("baseAsset" in top100.columns and not top100.empty) else {})
     signals["Coin"] = signals["base"].map(lambda b: lbl.get(b, f"{b} ({b})"))
     # format
     for c in ["price","MA20","MA50","Resistance","Support"]:
@@ -414,8 +427,11 @@ if not top100.empty:
     if sel:
         st.session_state["selected_base"] = sel[0]["baseAsset"]
     else:
-        if "selected_base" not in st.session_state:
+        if "selected_base" not in st.session_state and not gdf.empty:
             st.session_state["selected_base"] = gdf.iloc[0]["baseAsset"]
+else:
+    # kein Top100 → mindestens eine Basis für Einzel-Chart wählen
+    st.session_state.setdefault("selected_base", watchlist[0] if watchlist else "BTC")
 
 # ----------------- Einzel-Chart & Risk-Tools -----------------
 st.markdown("---")
