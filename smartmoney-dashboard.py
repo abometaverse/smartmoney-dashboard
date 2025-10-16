@@ -1,9 +1,8 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v2.9: Table-driven chart selection (checkbox "View"), historical entry dots,
-#       readable date axis, entry price auto-update per coin key.
-#       (basiert auf v2.8, Features bleiben erhalten)
+# v3.1  (Binance-first + CG fallback, Top-100 von Binance, Fortschritt,
+#       Table-driven Chart, historische Entry-Dots, sauberes Money-Format)
 #
 # Secrets (Streamlit → Advanced settings → Secrets):
 # APP_PASSWORD = "DeinStarkesPasswort"
@@ -86,7 +85,7 @@ CG_BASE = "https://api.coingecko.com/api/v3"
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/2.9 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/3.1 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -99,7 +98,7 @@ def _get_json(url, params=None, timeout=12, retries=2, backoff=1.6) -> Dict:
             r = session.get(url, params=params, timeout=timeout)
             if r.status_code == 200:
                 return {"ok": True, "json": r.json(), "status": 200}
-            if r.status_code in (429, 502, 503, 504):
+            if r.status_code in (429, 451, 502, 503, 504):
                 last_err = f"HTTP {r.status_code}"
                 time.sleep(backoff * (i + 1)); continue
             return {"ok": False, "json": None, "status": r.status_code, "error": r.text[:300]}
@@ -122,11 +121,35 @@ def fmt_money(n: float, decimals: int = 2) -> str:
     if n is None or (isinstance(n, float) and math.isnan(n)): return ""
     return f"{n:,.{decimals}f}"
 
-# ================= Analytics Helpers =================
+# ================= Basic helpers =================
 def ma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=max(2, window//2)).mean()
 
-@st.cache_data(ttl=3600, show_spinner=True)
+# ---------- Binance helpers ----------
+@st.cache_data(ttl=900, show_spinner=False)
+def binance_exchange_info() -> pd.DataFrame:
+    r = _get_json("https://api.binance.com/api/v3/exchangeInfo")
+    if not r.get("ok"): return pd.DataFrame()
+    df = pd.DataFrame(r["json"]["symbols"])
+    # nur handelbare USDT-Spot-Paare
+    df = df[(df["quoteAsset"]=="USDT") & (df["status"]=="TRADING") & (~df["symbol"].str.contains("UP|DOWN|BULL|BEAR"))]
+    return df[["symbol","baseAsset","quoteAsset"]].copy()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def binance_top100_by_quote_volume() -> pd.DataFrame:
+    """Top nach Quote-Volumen (24h), nur USDT-Spot. Gibt symbol, baseAsset zurück."""
+    info = binance_exchange_info()
+    if info.empty: return pd.DataFrame()
+    r = _get_json("https://api.binance.com/api/v3/ticker/24hr")
+    if not r.get("ok"): return pd.DataFrame()
+    t = pd.DataFrame(r["json"])
+    t = t.merge(info, on="symbol", how="inner")
+    t["quoteVolume"] = pd.to_numeric(t["quoteVolume"], errors="coerce")
+    t = t.sort_values("quoteVolume", ascending=False).head(100)
+    return t[["symbol","baseAsset","quoteVolume"]].reset_index(drop=True)
+
+# ---------- CoinGecko helpers ----------
+@st.cache_data(ttl=3600, show_spinner=False)
 def cg_top_coins(limit: int = 500) -> pd.DataFrame:
     rows = []; per_page = 250; pages = int(np.ceil(limit / per_page))
     for page in range(1, pages + 1):
@@ -139,65 +162,6 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
         rows.append(part)
     if not rows: return pd.DataFrame(columns=["id","symbol","name","market_cap"])
     return pd.concat(rows, ignore_index=True).drop_duplicates(subset=["id"]).head(limit)
-
-@st.cache_data(ttl=1200, show_spinner=False)
-def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
-    def _empty(status_text: str) -> pd.DataFrame:
-        df = pd.DataFrame(columns=["timestamp", "price", "volume"])
-        df.attrs["status"] = status_text; return df
-
-    # 1) CG
-    resp = _get_json(
-        f"{CG_BASE}/coins/{coin_id}/market_chart",
-        {"vs_currency": FIAT, "days": days, "interval": "daily"},
-        timeout=10, retries=1, backoff=1.2
-    )
-    if resp.get("ok"):
-        data = resp["json"]; prices = data.get("prices", []); vols = data.get("total_volumes", [])
-        if prices:
-            dfp = pd.DataFrame(prices, columns=["ts","price"]); dfv = pd.DataFrame(vols, columns=["ts","volume"])
-            df = dfp.merge(dfv, on="ts", how="left")
-            df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True, errors="coerce")
-            df["price"] = pd.to_numeric(df["price"], errors="coerce"); df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-            df = df[["timestamp","price","volume"]].dropna().sort_values("timestamp").tail(int(days)+1)
-            if not df.empty: df.attrs["status"]="ok"; df.attrs["source"]="cg"; return df
-
-    # 2) Binance
-    symbol_map = {"bitcoin":"BTCUSDT","ethereum":"ETHUSDT","solana":"SOLUSDT","arbitrum":"ARBUSDT","render-token":"RNDRUSDT","bittensor":"TAOUSDT"}
-    sym = symbol_map.get(coin_id)
-    if not sym:
-        try:
-            top = cg_top_coins(limit=500)
-            sym = top.loc[top["id"] == coin_id, "symbol"].str.upper().iloc[0] + "USDT"
-        except Exception:
-            return _empty("no_symbol")
-
-    endpoints = [
-        "https://api.binance.com/api/v3/klines",
-        "https://data-api.binance.vision/api/v3/klines",
-        "https://api.binance.us/api/v3/klines",
-    ]
-    kl = None; last_status = None
-    for base in endpoints:
-        try:
-            r = get_http().get(base, params={"symbol": sym, "interval":"1d", "limit":min(1000, int(days)+5)}, timeout=8)
-            last_status = r.status_code
-            if r.status_code != 200: time.sleep(0.2); continue
-            data = r.json()
-            if isinstance(data, list) and data and isinstance(data[0], (list,tuple)): kl = data; break
-        except Exception:
-            time.sleep(0.2); continue
-    if kl is None: return _empty(f"err_binance:{last_status}")
-
-    try:
-        df = pd.DataFrame(kl, columns=["openTime","open","high","low","close","volume","closeTime","qav","numTrades","takerBase","takerQuote","ignore"])
-        df["timestamp"] = pd.to_datetime(df["openTime"], unit="ms", utc=True, errors="coerce")
-        df["price"] = pd.to_numeric(df["close"], errors="coerce"); df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-        df = df[["timestamp","price","volume"]].dropna().sort_values("timestamp").tail(int(days)+1)
-        if df.empty: return _empty("empty_binance")
-        df.attrs["status"]="ok"; df.attrs["source"]="binance"; return df
-    except Exception:
-        return _empty("parse_binance")
 
 @st.cache_data(ttl=600, show_spinner=False)
 def cg_simple_price(ids: List[str]) -> pd.DataFrame:
@@ -213,6 +177,84 @@ def cg_simple_price(ids: List[str]) -> pd.DataFrame:
         if c not in df.columns: df[c]=np.nan
     return df[cols].rename(columns={"current_price":"price","total_volume":"volume_24h"})
 
+# ================= Historie (Binance-first, CG fallback) =================
+@st.cache_data(ttl=1200, show_spinner=False)
+def load_history(coin_or_symbol: str, days: int = 180) -> pd.DataFrame:
+    """Wenn coin_or_symbol wie 'BTCUSDT' aussieht -> direkt Binance.
+       Sonst: erst Binance über Mapping, dann CG fallback."""
+    def _empty(status_text: str, source: str = "") -> pd.DataFrame:
+        df = pd.DataFrame(columns=["timestamp","price","volume"])
+        df.attrs["status"] = status_text
+        if source: df.attrs["source"] = source
+        return df
+
+    # 1) Wenn direkt ein Binance-Symbol (USDT)
+    sym = None
+    if coin_or_symbol.upper().endswith("USDT") and coin_or_symbol.isascii():
+        sym = coin_or_symbol.upper()
+
+    # 2) Falls es eine CG-ID ist -> versuch Symbol-Mapping
+    if not sym:
+        try:
+            info = binance_exchange_info()
+            # naive Heuristik: suche baseAsset, der der id/symbol ähnlich ist
+            base = coin_or_symbol.upper()
+            row = info[(info["baseAsset"]==base)]
+            if not row.empty: sym = row.iloc[0]["symbol"]
+        except Exception:
+            pass
+
+    # ---------- Binance ----------
+    if sym:
+        endpoints = [
+            "https://api.binance.com/api/v3/klines",
+            "https://data-api.binance.vision/api/v3/klines",
+            "https://api.binance.us/api/v3/klines",
+        ]
+        kl = None; last_status = None
+        for base in endpoints:
+            try:
+                r = get_http().get(base, params={"symbol": sym, "interval":"1d", "limit":min(1000, int(days)+5)}, timeout=8)
+                last_status = r.status_code
+                if r.status_code != 200: time.sleep(0.2); continue
+                data = r.json()
+                if isinstance(data, list) and data and isinstance(data[0], (list,tuple)):
+                    kl = data; break
+            except Exception:
+                time.sleep(0.2); continue
+        if kl is None: 
+            # Binance schlug fehl -> CG als Fallback (wenn coin_or_symbol CG-ID ist)
+            pass
+        else:
+            try:
+                df = pd.DataFrame(kl, columns=["openTime","open","high","low","close","volume","closeTime","qav","numTrades","takerBase","takerQuote","ignore"])
+                df["timestamp"] = pd.to_datetime(df["openTime"], unit="ms", utc=True, errors="coerce")
+                df["price"]     = pd.to_numeric(df["close"], errors="coerce")
+                df["volume"]    = pd.to_numeric(df["volume"], errors="coerce")
+                df = df[["timestamp","price","volume"]].dropna().sort_values("timestamp").tail(int(days)+1)
+                if df.empty: return _empty("empty_binance","binance")
+                df.attrs["status"]="ok"; df.attrs["source"]="binance"; return df
+            except Exception:
+                return _empty("parse_binance","binance")
+
+    # ---------- CoinGecko Fallback ----------
+    resp = _get_json(
+        f"{CG_BASE}/coins/{coin_or_symbol}/market_chart",
+        {"vs_currency": FIAT, "days": days, "interval": "daily"},
+        timeout=10, retries=1, backoff=1.2
+    )
+    if not resp.get("ok"): return _empty(f"err_cg:{resp.get('status') or 'req'}","cg")
+    data = resp["json"]; prices = data.get("prices", []); vols = data.get("total_volumes", [])
+    if not prices: return _empty("empty_cg","cg")
+    dfp = pd.DataFrame(prices, columns=["ts","price"]); dfv = pd.DataFrame(vols, columns=["ts","volume"])
+    df = dfp.merge(dfv, on="ts", how="left")
+    df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True, errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce"); df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    df = df[["timestamp","price","volume"]].dropna().sort_values("timestamp").tail(int(days)+1)
+    if df.empty: return _empty("empty_cg","cg")
+    df.attrs["status"]="ok"; df.attrs["source"]="cg"; return df
+
+# ================= Analytics =================
 def calc_local_levels(dfd: pd.DataFrame, lookback: int = 20) -> Tuple[float,float]:
     if dfd.empty: return (np.nan, np.nan)
     d = dfd.iloc[:-1].tail(lookback)
@@ -267,10 +309,10 @@ for k, v in {
 
 days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15, key="days_hist")
 
-# Watchlist
+# Watchlist (aus CG – wegen Namensanzeige & Suche angenehm)
 top_df = cg_top_coins(limit=500)
 if top_df.empty:
-    st.sidebar.warning("Top-Liste konnte nicht geladen werden (API-Limit?). Fallback-Auswahl.")
+    st.sidebar.warning("Top-Liste (CG) konnte nicht geladen werden (Limit?). Fallback.")
     default_ids = ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
     selected_labels = st.sidebar.multiselect(
         "Watchlist (Fallback)",
@@ -320,15 +362,7 @@ st.session_state["vol_surge_thresh"] = vol_surge_thresh
 st.session_state["lookback_res"] = lookback_res
 st.session_state["alerts_enabled"] = alerts_enabled
 
-st.caption("🔒 Passwortschutz aktiv — Alerts via Telegram (optional).  •  Scans: Batch oder vollständige Watchlist mit Fortschrittsbalken.")
-
-# ================= Checklist =================
-with st.expander("📋 Tägliche Checkliste", expanded=False):
-    st.markdown("""
-**Morgens:** Scan → Kandidaten (Breakout + Volumen) notieren  
-**Mittags:** Entry nur bei Preis > MA20 > MA50 **und** Vol-Surge ≥ Schwelle **und** Breakout über Widerstand  
-**Abends:** Volumen-Trend prüfen, Trailing Stop nachziehen, Teilgewinne sichern
-""")
+st.caption("🔒 Passwortschutz aktiv — Alerts via Telegram (optional). • Scans: Batch oder komplette Watchlist (mit Fortschritt).")
 
 # ================= Snapshot =================
 with st.spinner("Lade Snapshot …"):
@@ -352,28 +386,44 @@ if not spot.empty:
 if "signals_cache" not in st.session_state: st.session_state["signals_cache"] = pd.DataFrame()
 if "history_cache" not in st.session_state: st.session_state["history_cache"] = {}
 
+def _name_and_symbol(coin_id: str) -> Tuple[str,str]:
+    """Versucht Name+Symbol aus CG-Top500; für Binance-Symbole (XYZUSDT) wird XYZ zurückgegeben."""
+    if coin_id.upper().endswith("USDT"):
+        sym = coin_id[:-4].upper()
+        return sym, sym
+    if not top_df.empty:
+        row = top_df[top_df["id"]==coin_id]
+        if not row.empty:
+            return row.iloc[0]["name"], str(row.iloc[0]["symbol"]).upper()
+    # Fallback: id -> NAME
+    return coin_id, coin_id[:4].upper()
+
 def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, lookback: int,
                          progress_label: str = "Scanne …") -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     rows, history_cache = [], {}
     total = len(id_list)
     prog  = st.progress(0, text=progress_label)
-    msg   = st.empty()
+    note  = st.empty()
     PAUSE_BETWEEN = 0.55
 
     for i, cid in enumerate(id_list, start=1):
-        msg.info(f"{progress_label}: Rang {i}/{total} — {cid}")
+        note.info(f"{progress_label}: Rang {i}/{total} — {cid}")
         time.sleep(PAUSE_BETWEEN)
-        hist = cg_market_chart(cid, days=days_hist)
+
+        hist = load_history(cid, days=days_hist)
         status_val = hist.attrs.get("status", "") if isinstance(hist, pd.DataFrame) else "no_df"
+
+        name, symbol = _name_and_symbol(cid)
 
         if (hist is None) or hist.empty or (status_val != "ok"):
             rows.append({
-                "id": cid, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
+                "id": cid, "name": name, "symbol": symbol,
+                "price": np.nan, "MA20": np.nan, "MA50": np.nan,
                 "Breakout_MA": False, "Vol_Surge_x": np.nan,
                 "Resistance": np.nan, "Support": np.nan,
                 "Breakout_Resistance": False, "Distribution_Risk": False,
                 "Entry_Signal": False, "status": status_val or "no data",
-                "source": status_val
+                "source": hist.attrs.get("source","") if isinstance(hist,pd.DataFrame) else ""
             })
             prog.progress(min(i/total, 1.0), text=f"{progress_label} ({i}/{total})")
             continue
@@ -386,7 +436,6 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
         dfd = dfd.dropna(subset=["timestamp","price"]).set_index("timestamp").sort_index()
         dfd = dfd.resample("1D").last().dropna(subset=["price"])
 
-        # Signals
         t_sig = trend_signals(dfd)
         v_sig = volume_signals(dfd)
         resistance, support = calc_local_levels(dfd, lookback=lookback)
@@ -398,7 +447,8 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
         entry_ok = bool(t_sig["breakout_ma"] and is_valid_vol and (volsurge >= vol_thresh))
 
         rows.append({
-            "id": cid, "price": price,
+            "id": cid, "name": name, "symbol": symbol,
+            "price": price,
             "MA20": t_sig["ma20"], "MA50": t_sig["ma50"],
             "Breakout_MA": t_sig["breakout_ma"], "Vol_Surge_x": volsurge,
             "Resistance": resistance, "Support": support,
@@ -411,7 +461,7 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
         prog.progress(min(i/total, 1.0), text=f"{progress_label} ({i}/{total})")
 
     prog.progress(1.0, text=f"{progress_label} (fertig)")
-    msg.empty()
+    note.empty()
     return pd.DataFrame(rows), history_cache
 
 def run_scan_batch():
@@ -461,6 +511,7 @@ if not signals_df.empty:
             return ['background-color: #fff9e6'] * len(row)
         return [''] * len(row)
 
+    display_df = display_df[["name","symbol","id","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]]
     st.dataframe(display_df.style.apply(_row_style, axis=1), use_container_width=True, hide_index=True)
 
 # ================= Detail & Risk — Top-100 =================
@@ -479,13 +530,37 @@ with c3:
     top_filter = st.radio("Filter", ["Alle (Top-100)", "Nur Entry-Signal (Top-100)", "Nur Watchlist"], index=0, horizontal=True)
 
 def load_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> pd.DataFrame:
-    with st.spinner("Lade Top-100 Liste …"):
-        top100 = cg_top_coins(limit=100)
-    ids100 = top100["id"].tolist() if not top100.empty else []
-    if not ids100:
+    # 1) Versuch Binance (quoteVolume)
+    top = binance_top100_by_quote_volume()
+    ids: List[str]
+    names: Dict[str, Tuple[str,str]] = {}
+    if not top.empty:
+        ids = top["symbol"].tolist()          # z.B. BTCUSDT
+        for _, r in top.iterrows():
+            base = str(r["baseAsset"]).upper()
+            names[r["symbol"]] = (base, base) # Name, Symbol (keine schönen Namen verfügbar)
+    else:
+        # 2) Fallback CG (Top Marketcap)
+        cg = cg_top_coins(limit=100)
+        ids = cg["id"].tolist() if not cg.empty else []
+        for _, r in cg.iterrows():
+            names[r["id"]] = (r["name"], str(r["symbol"]).upper())
+
+    if not ids:
         st.warning("Konnte Top-100 nicht laden.")
         return pd.DataFrame()
-    df100, _ = compute_rows_for_ids(ids100, days_hist, vol_surge_thresh, lookback_res, "Top-100-Scan")
+
+    df100, cache = compute_rows_for_ids(ids, days_hist, vol_surge_thresh, lookback_res, "Top-100-Scan")
+    # Namen/Symbole einsetzen (für Binance-Symbole sinnvoll)
+    if "name" not in df100.columns or "symbol" not in df100.columns:
+        df100["name"] = df100["id"].map(lambda x: names.get(x, (x, x))[0])
+        df100["symbol"] = df100["id"].map(lambda x: names.get(x, (x, x))[1])
+    else:
+        # sicherheitshalber überschreiben, wenn mapping existiert
+        df100["name"] = df100.apply(lambda r: names.get(r["id"], (r["name"], r["symbol"]))[0], axis=1)
+        df100["symbol"] = df100.apply(lambda r: names.get(r["id"], (r["name"], r["symbol"]))[1], axis=1)
+    # Historiencache übernehmen
+    st.session_state["history_cache"].update(cache)
     return df100
 
 do_load = refresh_btn or (auto_refresh and (time.time() - st.session_state["top100_cache_ts"] > 120)) or st.session_state["top100_df"].empty
@@ -497,8 +572,7 @@ if do_load:
 
 top100_df = st.session_state["top100_df"].copy()
 
-# ---- Table-driven Selection (kein Dropdown) ----
-# Wir fügen eine Checkbox-Spalte "View" hinzu. Der erste True-Eintrag steuert den Chart.
+# ---- Table-driven Selection (Checkbox "View") ----
 selected_coin_from_table = None
 
 if not top100_df.empty:
@@ -514,46 +588,30 @@ if not top100_df.empty:
     if "View" not in top100_view.columns:
         top100_view["View"] = False
 
-    # Standardauswahl: behalte vorherige oder erste Zeile
     prev = st.session_state.get("selected_coin")
     if prev in set(top100_view["id"]):
         top100_view.loc[top100_view["id"]==prev, "View"] = True
     elif not top100_view.empty:
         top100_view.loc[0, "View"] = True
 
-    # Anzeige mit Data Editor (anklickbar)
-    edit_cfg = {
-        "View": st.column_config.CheckboxColumn(required=False, help="Anklicken, um den Chart unten zu laden")
-    }
-    # Lesbarer Output
-    for c in ["price","MA20","MA50","Resistance","Support"]:
+    # Anzeige
+    show_cols = ["View","name","symbol","id","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]
+    for c in ["price","MA20","MA50","Resistance","Support","Vol_Surge_x"]:
         if c in top100_view.columns:
             top100_view[c] = pd.to_numeric(top100_view[c], errors="coerce")
-    fmt_cols = {
-        "price": "{:.4f}", "MA20": "{:.4f}", "MA50": "{:.4f}",
-        "Resistance": "{:.4f}", "Support": "{:.4f}",
-        "Vol_Surge_x": "{:.2f}"
-    }
+
     st.data_editor(
-        top100_view,
+        top100_view[show_cols],
         use_container_width=True,
         hide_index=True,
-        disabled=["id","price","MA20","MA50","Breakout_MA","Vol_Surge_x","Resistance","Support","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"],
-        column_config=edit_cfg,
+        disabled=[c for c in show_cols if c!="View"],
+        column_config={"View": st.column_config.CheckboxColumn(required=False, help="Anklicken, um den Chart unten zu laden")},
         num_rows="fixed",
         key="top100_editor"
     )
 
-    # ermitteln, welcher Coin markiert ist
-    edited = st.session_state["top100_editor"]
-    try:
-        df_edited = pd.DataFrame(edited["edited_rows"])
-    except Exception:
-        df_edited = pd.DataFrame()
-
-    # Falls keine edited_rows verfügbar (je nach Streamlit-Version), lese direkt aus DataFrame im State:
+    # Auswahl ermitteln (erste Zeile mit View==True)
     current_view_df = st.session_state["top100_editor"]["data"] if "data" in st.session_state["top100_editor"] else top100_view.to_dict("records")
-    # finde erste Zeile mit View==True
     for row in current_view_df:
         if row.get("View", False):
             selected_coin_from_table = row.get("id")
@@ -575,7 +633,7 @@ if coin_select:
     with st.spinner(f"Lade Historie für {coin_select} …"):
         d = st.session_state.get("history_cache", {}).get(coin_select)
         if d is None or not isinstance(d, pd.DataFrame) or d.empty:
-            d = cg_market_chart(coin_select, days=st.session_state["days_hist"])
+            d = load_history(coin_select, days=st.session_state["days_hist"])
             if isinstance(d, pd.DataFrame) and not d.empty:
                 st.session_state.setdefault("history_cache", {})
                 st.session_state["history_cache"][coin_select] = d
@@ -606,7 +664,7 @@ if coin_select:
             d_daily["entry_flag"] = (d_daily["price"] > d_daily["ma20"]) & (d_daily["ma20"] > d_daily["ma50"]) & \
                                     (d_daily["price"] > d_daily["roll_max_prev"]) & \
                                     (d_daily["vol_ratio"] >= vol_surge_thresh)
-            entries = d_daily[d_daily["entry_flag"]]
+            entries = d_daily[daily_mask := d_daily["entry_flag"]]
 
             fig, ax_price = plt.subplots()
             ax_vol = ax_price.twinx()
@@ -625,7 +683,7 @@ if coin_select:
             ax_vol.bar(d_daily.index, d_daily["volume"], alpha=0.28)
             ax_vol.set_ylabel("Volume")
 
-            # Datum lesbar machen
+            # Datum gut lesbar
             locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
             formatter = mdates.ConciseDateFormatter(locator)
             ax_price.xaxis.set_major_locator(locator)
@@ -649,7 +707,7 @@ if coin_select:
             max_loss = portfolio * (risk_pct/100.0)
             size_usd = max_loss / (stop_pct/100.0) if stop_pct>0 else 0.0
             size_qty = size_usd / entry_price if entry_price>0 else 0.0
-            st.write(f"**Max. Verlust:** ${max_loss:,.2f} • **Positionsgröße:** ${size_usd:,.2f} (~ {size_qty:,.4f} {coin_select.upper()})")
+            st.write(f"**Max. Verlust:** ${max_loss:,.2f} • **Positionsgröße:** ${size_usd:,.2f} (~ {size_qty:,.4f} {str(coin_select).upper()})")
 
             st.markdown("#### Trailing Stop")
             t1, t2 = st.columns(2)
