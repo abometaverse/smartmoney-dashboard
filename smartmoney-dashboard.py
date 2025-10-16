@@ -1,13 +1,10 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v2.6: Performance + Stabilität + Komfort
-#  - Compute-on-Click (Batch) + Full-Scan mit Fortschrittsbalken
-#  - Top-100-Scanner (Entry-Setup)
-#  - Konsolidierte Data-Source (cg/binance) + robuster Parser
-#  - Geldwerte mit Trennzeichen + kompakte Abkürzungen (K/M/B/T)
-#  - Keine Nutzung von st.experimental_get_query_params
-#  - Detail-Panel robust (Resample-Fallback)
+# v2.8: Top-100 Detail & Risk Tabelle (immer sichtbar) mit Progress
+#       Filter (Alle / Entry-Signal / Watchlist)
+#       Caching für Top-100-Scan, CG→Binance-Fallback, Geldformatierung
+#       Price+MA+Levels+Volume in 1 Chart, Telegram-Alerts optional
 #
 # Secrets (Streamlit → Advanced settings → Secrets):
 # APP_PASSWORD = "DeinStarkesPasswort"
@@ -17,12 +14,13 @@
 
 import math
 import time
+from typing import Tuple, Dict, List
+
 import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
-from typing import Tuple, Dict, List
 
 # ----------------- App Config -----------------
 st.set_page_config(page_title="Smart Money Dashboard — Geschützt", layout="wide")
@@ -88,7 +86,7 @@ CG_BASE = "https://api.coingecko.com/api/v3"
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/2.6 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/2.8 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
@@ -228,7 +226,6 @@ def cg_market_chart(coin_id: str, days: int = 180) -> pd.DataFrame:
                 time.sleep(0.2)
                 continue
             data = r.json()
-            # robust: Liste von Listen erwartet
             if isinstance(data, list) and len(data) > 0 and isinstance(data[0], (list, tuple)):
                 kl = data
                 break
@@ -378,10 +375,9 @@ vol_surge_thresh = st.sidebar.slider("Vol Surge vs 7d (x)", 1.0, 5.0, float(st.s
 lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 60, int(st.session_state["lookback_res"]), 1, key="lookback")
 alerts_enabled = st.sidebar.checkbox("Telegram-Alerts aktivieren (Secrets nötig)", value=bool(st.session_state["alerts_enabled"]), key="alerts_on")
 
-# Scan-Steuerung
+# Scan-Steuerung (bestehende Buttons bleiben)
 scan_now_batch = st.sidebar.button("🔔 Watchlist BATCH scannen", key="scan_btn_batch")
 scan_now_full  = st.sidebar.button("🔁 Ganze Watchlist scannen", key="scan_btn_full")
-scan_top100    = st.sidebar.button("🔍 Top 100 nach Setup scannen", key="scan_top100")
 
 # Batch-Regler
 batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 15, int(st.session_state["batch_size_slider"]), 1, key="batch_size_slider")
@@ -417,14 +413,11 @@ if not spot.empty:
         "id":"ID","symbol":"Symbol","name":"Name","price":"Price",
         "market_cap":"MktCap","volume_24h":"Vol 24h","price_change_percentage_24h":"% 24h"
     }).copy()
-
-    # Geldwerte formatieren
     if not disp.empty:
         disp["Price"]   = disp["Price"].apply(lambda x: fmt_money(x, 4))
         disp["MktCap"]  = disp["MktCap"].apply(human_abbr)
         disp["Vol 24h"] = disp["Vol 24h"].apply(human_abbr)
         disp["% 24h"]   = pd.to_numeric(disp["% 24h"], errors="coerce").map(lambda x: f"{x:.2f}%" if pd.notna(x) else "")
-
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
 # ================= Signals (Batch / Full) =================
@@ -438,9 +431,11 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
     rows, history_cache = [], {}
     total = len(id_list)
     prog  = st.progress(0, text=progress_label)
+    msg   = st.empty()
     PAUSE_BETWEEN = 0.55
 
     for i, cid in enumerate(id_list, start=1):
+        msg.info(f"{progress_label}: Rang {i}/{total} — {cid}")
         time.sleep(PAUSE_BETWEEN)
         hist = cg_market_chart(cid, days=days_hist)
         status_val = hist.attrs.get("status", "") if isinstance(hist, pd.DataFrame) else "no_df"
@@ -491,6 +486,7 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
         prog.progress(min(i/total, 1.0), text=f"{progress_label} ({i}/{total})")
 
     prog.progress(1.0, text=f"{progress_label} (fertig)")
+    msg.empty()
     return pd.DataFrame(rows), history_cache
 
 def run_scan_batch():
@@ -509,12 +505,11 @@ def run_scan_full_watchlist():
     st.info("🔁 Scanne gesamte Watchlist …")
     return compute_rows_for_ids(selected_ids, days_hist, vol_surge_thresh, lookback_res, "Watchlist-Scan")
 
-# Ausführung
+# Ausführung (bestehende Scans)
 if scan_now_batch:
     sig, hist_cache = run_scan_batch()
     st.session_state["signals_cache"] = sig
     st.session_state["history_cache"].update(hist_cache)
-
 elif scan_now_full:
     sig, hist_cache = run_scan_full_watchlist()
     st.session_state["signals_cache"] = sig
@@ -522,9 +517,8 @@ elif scan_now_full:
 
 signals_df = st.session_state["signals_cache"].copy()
 
-st.subheader("🔎 Signals & Levels")
+st.subheader("🔎 Signals & Levels (Watchlist)")
 if not signals_df.empty:
-    # Geldwerte formatieren (Preis, Levels)
     for c in ["price","MA20","MA50","Resistance","Support"]:
         if c in signals_df.columns:
             signals_df[c] = pd.to_numeric(signals_df[c], errors="coerce")
@@ -537,31 +531,169 @@ if not signals_df.empty:
     display_df["Vol_Surge_x"]= pd.to_numeric(display_df["Vol_Surge_x"], errors="coerce").map(lambda x: f"{x:.2f}x" if pd.notna(x) else "")
 
     def _row_style(row):
-        if bool(row.get("Entry_Signal", False)): return ['background-color: #e6ffed'] * len(row)   # grün
-        if bool(row.get("Distribution_Risk", False)): return ['background-color: #ffecec'] * len(row)  # rot
+        if bool(row.get("Entry_Signal", False)): return ['background-color: #e6ffed'] * len(row)
+        if bool(row.get("Distribution_Risk", False)): return ['background-color: #ffecec'] * len(row)
         if bool(row.get("Breakout_MA", False)) or bool(row.get("Breakout_Resistance", False)):
-            return ['background-color: #fff9e6'] * len(row)  # gelb
+            return ['background-color: #fff9e6'] * len(row)
         return [''] * len(row)
 
     st.dataframe(display_df.style.apply(_row_style, axis=1), use_container_width=True, hide_index=True)
 
-    # Alerts auf Batch- oder Full-Scan
-    if (scan_now_batch or scan_now_full) and st.session_state["alerts_enabled"]:
-        hits = signals_df[signals_df["Entry_Signal"] == True]
-        if hits.empty:
-            st.info("Keine Entry-Signale.")
-        else:
-            ok_any = False
-            for _, r in hits.iterrows():
-                ok = send_telegram(
-                    f"🚨 Entry-Signal: {r['id']} | Preis: ${r['price']:.3f} | "
-                    f"Breakout über Widerstand {r['Resistance']:.3f} | Vol-Surge: {r['Vol_Surge_x']:.2f}x"
-                )
-                ok_any = ok_any or ok
-            st.success("Telegram-Alerts gesendet." if ok_any else "Alert-Versand fehlgeschlagen (TELEGRAM_* prüfen).")
+# ================= Detail & Risk – Top-100 (immer sichtbar) =================
+st.markdown("---")
+st.subheader("📈 Detail & Risk — Top-100 Universum")
 
-# Fortschritts-Hinweis bei Batch
-if len(selected_ids) > 0 and not scan_now_full:
+# Cache-Struktur für Top-100 Ergebnisse
+st.session_state.setdefault("top100_df", pd.DataFrame())
+st.session_state.setdefault("top100_cache_ts", 0.0)
+
+c1, c2, c3 = st.columns([1.5,1.2,1.2])
+with c1:
+    auto_refresh = st.toggle("Top-100 bei Aufruf aktualisieren", value=False, help="Wenn aktiv, werden die Top-100 beim Öffnen der App neu gescannt (kann API-Limits treffen).")
+with c2:
+    refresh_btn = st.button("🔄 Top-100 aktualisieren")
+with c3:
+    top_filter = st.radio(
+        "Filter",
+        options=["Alle (Top-100)", "Nur Entry-Signal (Top-100)", "Nur Watchlist"],
+        index=0,
+        horizontal=True
+    )
+
+def load_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> pd.DataFrame:
+    with st.spinner("Lade Top-100 Liste …"):
+        top100 = cg_top_coins(limit=100)
+    ids100 = top100["id"].tolist() if not top100.empty else []
+    if not ids100:
+        st.warning("Konnte Top-100 nicht laden.")
+        return pd.DataFrame()
+    df100, _ = compute_rows_for_ids(ids100, days_hist, vol_surge_thresh, lookback_res, "Top-100-Scan")
+    return df100
+
+# Auto-Refresh oder Button
+do_load = refresh_btn or (auto_refresh and (time.time() - st.session_state["top100_cache_ts"] > 120)) or st.session_state["top100_df"].empty
+if do_load:
+    df100 = load_top100(days_hist, vol_surge_thresh, lookback_res)
+    if not df100.empty:
+        st.session_state["top100_df"] = df100
+        st.session_state["top100_cache_ts"] = time.time()
+
+top100_df = st.session_state["top100_df"].copy()
+
+# Filter anwenden
+if not top100_df.empty:
+    if top_filter == "Nur Entry-Signal (Top-100)":
+        top100_view = top100_df[(top100_df["Entry_Signal"] == True) & (top100_df["status"] == "ok")].copy()
+    elif top_filter == "Nur Watchlist":
+        wl = set(selected_ids)
+        top100_view = top100_df[top100_df["id"].isin(wl)].copy()
+    else:
+        top100_view = top100_df.copy()
+
+    # Formatierung
+    for c in ["price","MA20","MA50","Resistance","Support"]:
+        if c in top100_view.columns:
+            top100_view[c] = pd.to_numeric(top100_view[c], errors="coerce")
+    top100_view["price"]      = top100_view["price"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
+    top100_view["MA20"]       = top100_view["MA20"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
+    top100_view["MA50"]       = top100_view["MA50"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
+    top100_view["Resistance"] = top100_view["Resistance"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
+    top100_view["Support"]    = top100_view["Support"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
+    top100_view["Vol_Surge_x"]= pd.to_numeric(top100_view["Vol_Surge_x"], errors="coerce").map(lambda x: f"{x:.2f}x" if pd.notna(x) else "")
+
+    def _row_style2(row):
+        if bool(row.get("Entry_Signal", False)): return ['background-color: #e6ffed'] * len(row)
+        if bool(row.get("Distribution_Risk", False)): return ['background-color: #ffecec'] * len(row)
+        if bool(row.get("Breakout_MA", False)) or bool(row.get("Breakout_Resistance", False)):
+            return ['background-color: #fff9e6'] * len(row)
+        return [''] * len(row)
+
+    st.dataframe(top100_view.style.apply(_row_style2, axis=1), use_container_width=True, hide_index=True)
+else:
+    st.info("Noch keine Top-100 Daten geladen. Klicke auf **„Top-100 aktualisieren“** oder aktiviere Auto-Refresh.")
+
+# ================= Detail-Chart & Risk-Tools (ein Coin) =================
+st.markdown("---")
+st.subheader("🔍 Einzel-Chart & Risk-Tools")
+
+# Quelle für Auswahlliste: priorisiere Top-100 Tabelle, sonst Watchlist
+select_source = st.session_state["top100_df"]["id"].tolist() if not st.session_state["top100_df"].empty else selected_ids
+coin_select = st.selectbox("Coin", options=select_source or selected_ids, key="detail_coin")
+
+if coin_select:
+    with st.spinner(f"Lade Historie für {coin_select} …"):
+        d = st.session_state.get("history_cache", {}).get(coin_select)
+        if d is None or not isinstance(d, pd.DataFrame) or d.empty:
+            d = cg_market_chart(coin_select, days=st.session_state["days_hist"])
+            if isinstance(d, pd.DataFrame) and not d.empty:
+                st.session_state.setdefault("history_cache", {})
+                st.session_state["history_cache"][coin_select] = d
+
+    status_val = d.attrs.get("status", "") if isinstance(d, pd.DataFrame) else ""
+    src_val    = d.attrs.get("source", "")
+    if (d is None) or d.empty or (status_val != "ok"):
+        st.warning("Keine Historie verfügbar (API-Limit, 451/403 oder leere Daten).")
+    else:
+        st.caption(f"Datenquelle: {src_val or 'unbekannt'}")
+
+        dfd = d.copy()
+        dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
+        dfd["price"]  = pd.to_numeric(dfd["price"], errors="coerce")
+        dfd["volume"] = pd.to_numeric(dfd["volume"], errors="coerce")
+        dfd = dfd.dropna(subset=["timestamp","price"]).set_index("timestamp").sort_index()
+
+        d_daily = dfd.resample("1D").last().dropna(subset=["price"])
+        if d_daily.empty:
+            d_daily = dfd
+
+        r, s  = calc_local_levels(d_daily, lookback=lookback_res)
+        v_sig = volume_signals(d_daily)
+
+        fig, ax_price = plt.subplots()
+        ax_vol = ax_price.twinx()
+
+        ax_price.plot(d_daily.index, d_daily["price"], label="Price", linewidth=1.5)
+        ax_price.plot(d_daily.index, ma(d_daily["price"],20), label="MA20", linewidth=1.0)
+        ax_price.plot(d_daily.index, ma(d_daily["price"],50), label="MA50", linewidth=1.0)
+
+        if not np.isnan(r): ax_price.axhline(r, linestyle="--", label=f"Resistance {r:.3f}")
+        if not np.isnan(s): ax_price.axhline(s, linestyle="--", label=f"Support {s:.3f}")
+
+        ax_vol.bar(d_daily.index, d_daily["volume"], alpha=0.3)
+        ax_vol.set_ylabel("Volume")
+
+        ax_price.set_title(f"{coin_select} — Price, MAs, Levels & Volume")
+        ax_price.set_xlabel("Date"); ax_price.set_ylabel("USD")
+        ax_price.legend(loc="upper left")
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+
+        st.markdown("### 🧮 Position & Trailing Stop")
+        c1, c2, c3, c4 = st.columns(4)
+        portfolio   = c1.number_input("Portfolio (USD)", min_value=0.0, value=8000.0, step=100.0, format="%.2f", key="pos_port")
+        risk_pct    = c2.slider("Risiko/Trade (%)", 0.5, 3.0, 2.0, 0.1, key="pos_risk")
+        stop_pct    = c3.slider("Stop-Entfernung (%)", 3.0, 25.0, 8.0, 0.5, key="pos_stop")
+        entry_price = c4.number_input("Entry-Preis", min_value=0.0, value=float(d_daily['price'].iloc[-1]), step=0.001, format="%.6f", key="pos_entry")
+
+        max_loss = portfolio * (risk_pct/100.0)
+        size_usd = max_loss / (stop_pct/100.0) if stop_pct>0 else 0.0
+        size_qty = size_usd / entry_price if entry_price>0 else 0.0
+        st.write(f"**Max. Verlust:** ${max_loss:,.2f} • **Positionsgröße:** ${size_usd:,.2f} (~ {size_qty:,.4f} {coin_select.upper()})")
+
+        st.markdown("#### Trailing Stop")
+        t1, t2 = st.columns(2)
+        trail_pct = t1.slider("Trail (%)", 5.0, 25.0, 10.0, 0.5, key="trail_pct")
+        high_since_entry = t2.number_input("Höchster Kurs seit Entry", min_value=0.0, value=float(d_daily['price'].iloc[-1]), step=0.001, format="%.6f", key="trail_high")
+        tstop = trailing_stop(high_since_entry, trail_pct)
+        st.write(f"Trailing Stop bei **${tstop:,.3f}** (High {high_since_entry:,.3f}, Trail {trail_pct:.1f}%)")
+
+        if v_sig["distribution_risk"]:
+            st.warning("Distribution-Risk: Preis ↑ bei Volumen < 0.8× 7d-Ø.")
+        else:
+            st.success("Volumen ok (keine Distribution-Anzeichen).")
+
+# Fortschritts-Hinweis bei Batch (Info unten)
+if len(selected_ids) > 0:
     start = st.session_state.get("scan_index", 0)
     end = min(start + int(st.session_state["batch_size_slider"]), len(selected_ids))
     if end == len(selected_ids):
@@ -569,134 +701,3 @@ if len(selected_ids) > 0 and not scan_now_full:
     else:
         nxt_end = min(end + int(st.session_state["batch_size_slider"]), len(selected_ids))
         st.info(f"➡️ Nächster Batch lädt Coins {end+1}–{nxt_end} von {len(selected_ids)}.")
-
-# ----------------- Detail & Risk-Tools -------------
-st.markdown("---")
-st.subheader("📈 Detail & Risk-Tools")
-
-coin_select = st.selectbox(
-    "Coin",
-    options=[r["id"] for _, r in signals_df.iterrows()] if not signals_df.empty else selected_ids,
-    key="detail_coin"
-)
-
-if coin_select:
-    d = st.session_state.get("history_cache", {}).get(coin_select)
-    # Falls nicht im Batch geladen: jetzt einmalig nachladen
-    if d is None or d.empty:
-        d = cg_market_chart(coin_select, days=st.session_state["days_hist"])
-        if isinstance(d, pd.DataFrame) and not d.empty:
-            # im Session-Cache ablegen, damit bei erneutem Öffnen kein zweiter Call nötig ist
-            st.session_state.setdefault("history_cache", {})
-            st.session_state["history_cache"][coin_select] = d
-
-    # Status akzeptiert "ok", "ok_cg", "ok_binance"
-    status_val = (d.attrs.get("status", "") if isinstance(d, pd.DataFrame) else "")
-    if d is None or d.empty or (not str(status_val).startswith("ok")):
-        st.warning("Keine Historie verfügbar (API-Limit oder leere Daten).")
-        st.stop()
-
-    # optional Quelle anzeigen
-    st.caption(f"Datenquelle: {str(status_val).replace('ok_', '')}")
-
-    df = d.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
-    if df.empty:
-        st.warning("Keine validen Datenpunkte für das Chart gefunden.")
-        st.stop()
-
-    daily = df.set_index("timestamp").resample("1D").last().dropna(subset=["price"])
-    daily["ma20"] = ma(daily["price"], 20)
-    daily["ma50"] = ma(daily["price"], 50)
-    lookback_val = int(st.session_state.get("lookback_res", lookback_res))
-    resistance_lvl, support_lvl = calc_local_levels(daily.reset_index(drop=True), lookback=lookback_val)
-
-    col_chart, col_trail = st.columns([3, 1])
-
-    with col_chart:
-        fig, ax_price = plt.subplots(figsize=(10, 5))
-        ax_price.plot(daily.index, daily["price"], label="Preis", color="#1f77b4", linewidth=2)
-        if daily["ma20"].notna().any():
-            ax_price.plot(daily.index, daily["ma20"], label="MA20", color="#ff7f0e", linestyle="--")
-        if daily["ma50"].notna().any():
-            ax_price.plot(daily.index, daily["ma50"], label="MA50", color="#2ca02c", linestyle=":")
-        if not math.isnan(resistance_lvl):
-            ax_price.axhline(
-                resistance_lvl,
-                color="#d62728",
-                linestyle="--",
-                linewidth=1.2,
-                label=f"Resistance ({lookback_val}d)",
-            )
-        if not math.isnan(support_lvl):
-            ax_price.axhline(
-                support_lvl,
-                color="#17becf",
-                linestyle="--",
-                linewidth=1.2,
-                label=f"Support ({lookback_val}d)",
-            )
-        ax_price.set_ylabel("Preis (USD)")
-        ax_price.grid(True, linestyle=":", alpha=0.4)
-
-        ax_vol = ax_price.twinx()
-        ax_vol.bar(daily.index, daily["volume"], label="Volumen", color="#bbbbbb", alpha=0.4)
-        ax_vol.set_ylabel("Volumen")
-
-        handles, labels = ax_price.get_legend_handles_labels()
-        if handles:
-            ax_price.legend(handles, labels, loc="upper left")
-        fig.autofmt_xdate()
-        st.pyplot(fig, clear_figure=True)
-
-    with col_trail:
-        res_text = f"${resistance_lvl:,.2f}" if not math.isnan(resistance_lvl) else "–"
-        sup_text = f"${support_lvl:,.2f}" if not math.isnan(support_lvl) else "–"
-        st.metric("Resistance", res_text, help=f"Berechnet aus den letzten {lookback_val} Tagen (ohne aktuelle Kerze).")
-        st.metric("Support", sup_text, help=f"Berechnet aus den letzten {lookback_val} Tagen (ohne aktuelle Kerze).")
-        trail_pct = st.slider("Trailing Stop (%)", min_value=2, max_value=30, value=10, step=1)
-        lookback_window = min(lookback_val, len(daily))
-        if lookback_window > 0:
-            window_slice = daily["price"].iloc[-lookback_window:]
-            recent_high = float(window_slice.max())
-            stop_level = trailing_stop(recent_high, trail_pct)
-            st.metric("Trailing Stop", f"${stop_level:,.2f}")
-        else:
-            st.metric("Trailing Stop", "–")
-
-    st.caption(
-        "Preis (Linie) mit MA20/MA50, Widerstand/Support (Lookback) sowie Volumen (Balken). Rechts: Levels und dynamischer Trailing Stop."
-    )
-
-# ================= Top-100 Scanner =================
-st.markdown("---")
-st.subheader("🏆 Top-100 Setup-Scanner")
-
-if scan_top100:
-    with st.spinner("Lade Top-100 Liste …"):
-        top100 = cg_top_coins(limit=100)
-    ids100 = top100["id"].tolist() if not top100.empty else []
-    if not ids100:
-        st.warning("Konnte Top-100 nicht laden.")
-    else:
-        df100, _ = compute_rows_for_ids(ids100, days_hist, vol_surge_thresh, lookback_res, "Top-100-Scan")
-        hits = df100[(df100["Entry_Signal"] == True) & (df100["status"] == "ok")].copy()
-
-        # Geldwerte formatieren
-        for c in ["price","MA20","MA50","Resistance","Support"]:
-            if c in hits.columns:
-                hits[c] = pd.to_numeric(hits[c], errors="coerce")
-        hits["price"]      = hits["price"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-        hits["MA20"]       = hits["MA20"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-        hits["MA50"]       = hits["MA50"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-        hits["Resistance"] = hits["Resistance"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-        hits["Support"]    = hits["Support"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-        hits["Vol_Surge_x"]= pd.to_numeric(hits["Vol_Surge_x"], errors="coerce").map(lambda x: f"{x:.2f}x" if pd.notna(x) else "")
-
-        st.subheader("✅ Treffer (Top-100, Setup erfüllt)")
-        if hits.empty:
-            st.info("Kein Top-100 Coin erfüllt aktuell das Setup.")
-        else:
-            st.dataframe(hits, use_container_width=True, hide_index=True)
-
