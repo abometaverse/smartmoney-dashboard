@@ -570,7 +570,7 @@ if len(selected_ids) > 0 and not scan_now_full:
         nxt_end = min(end + int(st.session_state["batch_size_slider"]), len(selected_ids))
         st.info(f"➡️ Nächster Batch lädt Coins {end+1}–{nxt_end} von {len(selected_ids)}.")
 
-# ================= Detail & Risk-Tools =================
+# ----------------- Detail & Risk-Tools -------------
 st.markdown("---")
 st.subheader("📈 Detail & Risk-Tools")
 
@@ -581,52 +581,93 @@ coin_select = st.selectbox(
 )
 
 if coin_select:
-    with st.spinner(f"Lade Historie für {coin_select} …"):
-        d = st.session_state.get("history_cache", {}).get(coin_select)
-        if d is None or not isinstance(d, pd.DataFrame) or d.empty:
-            d = cg_market_chart(coin_select, days=st.session_state["days_hist"])
-            if isinstance(d, pd.DataFrame) and not d.empty:
-                st.session_state.setdefault("history_cache", {})
-                st.session_state["history_cache"][coin_select] = d
+    d = st.session_state.get("history_cache", {}).get(coin_select)
+    # Falls nicht im Batch geladen: jetzt einmalig nachladen
+    if d is None or d.empty:
+        d = cg_market_chart(coin_select, days=st.session_state["days_hist"])
+        if isinstance(d, pd.DataFrame) and not d.empty:
+            # im Session-Cache ablegen, damit bei erneutem Öffnen kein zweiter Call nötig ist
+            st.session_state.setdefault("history_cache", {})
+            st.session_state["history_cache"][coin_select] = d
 
-    status_val = d.attrs.get("status", "") if isinstance(d, pd.DataFrame) else ""
-    src_val    = d.attrs.get("source", "")
-    if (d is None) or d.empty or (status_val != "ok"):
-        st.warning("Keine Historie verfügbar (API-Limit, 451/403 oder leere Daten).")
-    else:
-        st.caption(f"Datenquelle: {src_val or 'unbekannt'}")
+    # Status akzeptiert "ok", "ok_cg", "ok_binance"
+    status_val = (d.attrs.get("status", "") if isinstance(d, pd.DataFrame) else "")
+    if d is None or d.empty or (not str(status_val).startswith("ok")):
+        st.warning("Keine Historie verfügbar (API-Limit oder leere Daten).")
+        st.stop()
 
-        dfd = d.copy()
-        dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
-        dfd["price"]  = pd.to_numeric(dfd["price"], errors="coerce")
-        dfd["volume"] = pd.to_numeric(dfd["volume"], errors="coerce")
-        dfd = dfd.dropna(subset=["timestamp","price"]).set_index("timestamp").sort_index()
+    # optional Quelle anzeigen
+    st.caption(f"Datenquelle: {str(status_val).replace('ok_', '')}")
 
-        d_daily = dfd.resample("1D").last().dropna(subset=["price"])
-        if d_daily.empty:
-            d_daily = dfd  # Fallback
+    df = d.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
+    if df.empty:
+        st.warning("Keine validen Datenpunkte für das Chart gefunden.")
+        st.stop()
 
-        r, s  = calc_local_levels(d_daily, lookback=lookback_res)
-        v_sig = volume_signals(d_daily)
+    daily = df.set_index("timestamp").resample("1D").last().dropna(subset=["price"])
+    daily["ma20"] = ma(daily["price"], 20)
+    daily["ma50"] = ma(daily["price"], 50)
+    lookback_val = int(st.session_state.get("lookback_res", lookback_res))
+    resistance_lvl, support_lvl = calc_local_levels(daily.reset_index(drop=True), lookback=lookback_val)
 
-        fig, ax = plt.subplots()
-        ax.plot(d_daily.index, d_daily["price"], label="Price")
-        ax.plot(d_daily.index, ma(d_daily["price"],20), label="MA20")
-        ax.plot(d_daily.index, ma(d_daily["price"],50), label="MA50")
-        if not np.isnan(r): ax.axhline(r, linestyle="--", label=f"Resistance {r:.3f}")
-        if not np.isnan(s): ax.axhline(s, linestyle="--", label=f"Support {s:.3f}")
-        ax.set_title(f"{coin_select} — Price & Levels"); ax.set_xlabel("Date"); ax.set_ylabel("USD"); ax.legend()
-        st.pyplot(fig, use_container_width=True)
+    col_chart, col_trail = st.columns([3, 1])
 
-        fig2, ax2 = plt.subplots()
-        ax2.bar(d_daily.index, d_daily["volume"])
-        ax2.set_title(f"{coin_select} — Daily Volume"); ax2.set_xlabel("Date"); ax2.set_ylabel("USD")
-        st.pyplot(fig2, use_container_width=True)
+    with col_chart:
+        fig, ax_price = plt.subplots(figsize=(10, 5))
+        ax_price.plot(daily.index, daily["price"], label="Preis", color="#1f77b4", linewidth=2)
+        if daily["ma20"].notna().any():
+            ax_price.plot(daily.index, daily["ma20"], label="MA20", color="#ff7f0e", linestyle="--")
+        if daily["ma50"].notna().any():
+            ax_price.plot(daily.index, daily["ma50"], label="MA50", color="#2ca02c", linestyle=":")
+        if not math.isnan(resistance_lvl):
+            ax_price.axhline(
+                resistance_lvl,
+                color="#d62728",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"Resistance ({lookback_val}d)",
+            )
+        if not math.isnan(support_lvl):
+            ax_price.axhline(
+                support_lvl,
+                color="#17becf",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"Support ({lookback_val}d)",
+            )
+        ax_price.set_ylabel("Preis (USD)")
+        ax_price.grid(True, linestyle=":", alpha=0.4)
 
-        if v_sig["distribution_risk"]:
-            st.warning("Distribution-Risk: Preis ↑ bei Volumen < 0.8× 7d-Ø.")
+        ax_vol = ax_price.twinx()
+        ax_vol.bar(daily.index, daily["volume"], label="Volumen", color="#bbbbbb", alpha=0.4)
+        ax_vol.set_ylabel("Volumen")
+
+        handles, labels = ax_price.get_legend_handles_labels()
+        if handles:
+            ax_price.legend(handles, labels, loc="upper left")
+        fig.autofmt_xdate()
+        st.pyplot(fig, clear_figure=True)
+
+    with col_trail:
+        res_text = f"${resistance_lvl:,.2f}" if not math.isnan(resistance_lvl) else "–"
+        sup_text = f"${support_lvl:,.2f}" if not math.isnan(support_lvl) else "–"
+        st.metric("Resistance", res_text, help=f"Berechnet aus den letzten {lookback_val} Tagen (ohne aktuelle Kerze).")
+        st.metric("Support", sup_text, help=f"Berechnet aus den letzten {lookback_val} Tagen (ohne aktuelle Kerze).")
+        trail_pct = st.slider("Trailing Stop (%)", min_value=2, max_value=30, value=10, step=1)
+        lookback_window = min(lookback_val, len(daily))
+        if lookback_window > 0:
+            window_slice = daily["price"].iloc[-lookback_window:]
+            recent_high = float(window_slice.max())
+            stop_level = trailing_stop(recent_high, trail_pct)
+            st.metric("Trailing Stop", f"${stop_level:,.2f}")
         else:
-            st.success("Volumen ok (keine Distribution-Anzeichen).")
+            st.metric("Trailing Stop", "–")
+
+    st.caption(
+        "Preis (Linie) mit MA20/MA50, Widerstand/Support (Lookback) sowie Volumen (Balken). Rechts: Levels und dynamischer Trailing Stop."
+    )
 
 # ================= Top-100 Scanner =================
 st.markdown("---")
@@ -658,3 +699,4 @@ if scan_top100:
             st.info("Kein Top-100 Coin erfüllt aktuell das Setup.")
         else:
             st.dataframe(hits, use_container_width=True, hide_index=True)
+
