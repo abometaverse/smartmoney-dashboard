@@ -1,8 +1,8 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v3.3  (Snapshot entfernt, Pro-Table-UX, Badge für aktiven Coin,
-#       Streamlit Data Editor mit Filtern, Rang-Spalten, Binance-only Top-100)
+# v3.3.1  (Hotfix: robuste Tabellen-Selektion, defensive Guards,
+#         Null-sichere Mappings, keine Snapshot-Tabelle)
 #
 # Secrets (Streamlit → Advanced settings → Secrets):
 # APP_PASSWORD = "DeinStarkesPasswort"
@@ -12,7 +12,7 @@
 
 import math
 import time
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 
 import requests
 import pandas as pd
@@ -50,9 +50,9 @@ def auth_gate() -> None:
         c1.success("Zugriff gewährt.")
         if c2.button("Logout"):
             save_state([
-                "selected_ids", "min_mktcap", "min_volume",
-                "vol_surge_thresh", "lookback_res", "alerts_enabled",
-                "days_hist", "batch_size_slider", "selected_coin"
+                "selected_ids", "vol_surge_thresh", "lookback_res",
+                "alerts_enabled", "days_hist", "batch_size_slider",
+                "scan_index", "selected_coin"
             ])
             st.session_state["AUTH_OK"] = False
             st.success("Einstellungen gespeichert.")
@@ -67,9 +67,9 @@ def auth_gate() -> None:
             if pw == secret_pw:
                 st.session_state["AUTH_OK"] = True
                 restore_state([
-                    "selected_ids", "min_mktcap", "min_volume",
-                    "vol_surge_thresh", "lookback_res", "alerts_enabled",
-                    "days_hist", "batch_size_slider", "selected_coin"
+                    "selected_ids", "vol_surge_thresh", "lookback_res",
+                    "alerts_enabled", "days_hist", "batch_size_slider",
+                    "scan_index", "selected_coin"
                 ])
                 st.rerun()
             else:
@@ -80,7 +80,7 @@ auth_gate()
 
 # ================= Constants & HTTP =================
 FIAT = "usd"
-CG_BASE = "https://api.coingecko.com/api/v3"   # nur für Watchlist-Suche (komfort)
+CG_BASE = "https://api.coingecko.com/api/v3"   # nur für Watchlist-Suche (Komfort)
 BINANCE_ENDPOINTS = [
     "https://api.binance.com",
     "https://data-api.binance.vision",
@@ -90,7 +90,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/3.3 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/3.3.1 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -187,7 +187,9 @@ def binance_top100_by_quote_volume() -> pd.DataFrame:
     df["rank"] = df.index + 1
     df["name"] = df["baseAsset"].str.upper()
     df["symbol_txt"] = df["baseAsset"].str.upper()
-    return df[["rank","symbol","name","symbol_txt","quoteVolume"]].rename(columns={"symbol_txt":"symbol2"})
+    # ID = Binance-Symbol (stabil für Historie)
+    df["id"] = df["symbol"]
+    return df[["rank","id","symbol","name","symbol_txt","quoteVolume"]].rename(columns={"symbol_txt":"symbol2"})
 
 # ---------- CoinGecko nur für Watchlist-Suche ----------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -204,7 +206,7 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
     if not rows: return pd.DataFrame(columns=["id","symbol","name","market_cap"])
     return pd.concat(rows, ignore_index=True).drop_duplicates(subset=["id"]).head(limit)
 
-# ---------- History (Binance-first, CG-fallback) ----------
+# ---------- History (Binance-first) ----------
 @st.cache_data(ttl=1200, show_spinner=False)
 def load_history(coin_or_symbol: str, days: int = 180) -> pd.DataFrame:
     def _empty(status_text: str, source: str = "") -> pd.DataFrame:
@@ -214,44 +216,47 @@ def load_history(coin_or_symbol: str, days: int = 180) -> pd.DataFrame:
         return df
 
     sym = None
-    if coin_or_symbol.upper().endswith("USDT") and coin_or_symbol.isascii():
+    if coin_or_symbol and isinstance(coin_or_symbol, str) and coin_or_symbol.upper().endswith("USDT"):
         sym = coin_or_symbol.upper()
     if not sym:
         try:
             info = binance_exchange_info()
-            base = coin_or_symbol.upper()
-            row = info[(info["baseAsset"]==base)]
-            if not row.empty: sym = row.iloc[0]["symbol"]
+            if not info.empty:
+                base = (coin_or_symbol or "").upper()
+                row = info[(info["baseAsset"]==base)]
+                if not row.empty: sym = row.iloc[0]["symbol"]
         except Exception:
             pass
 
-    if sym:
-        kl = None; last_status = None
-        for base in BINANCE_ENDPOINTS:
-            try:
-                r = get_http().get(f"{base}/api/v3/klines",
-                                   params={"symbol": sym, "interval":"1d", "limit":min(1000, int(days)+5)}, timeout=8)
-                last_status = r.status_code
-                if r.status_code != 200: time.sleep(0.2); continue
-                data = r.json()
-                if isinstance(data, list) and data and isinstance(data[0], (list,tuple)):
-                    kl = data; break
-            except Exception:
-                time.sleep(0.2); continue
-        if kl is not None:
-            try:
-                df = pd.DataFrame(kl, columns=["openTime","open","high","low","close","volume","closeTime","qav","numTrades","takerBase","takerQuote","ignore"])
-                df["timestamp"] = pd.to_datetime(df["openTime"], unit="ms", utc=True, errors="coerce")
-                df["price"]     = pd.to_numeric(df["close"], errors="coerce")
-                df["volume"]    = pd.to_numeric(df["volume"], errors="coerce")
-                df = df[["timestamp","price","volume"]].dropna().sort_values("timestamp").tail(int(days)+1)
-                if df.empty: return _empty("empty_binance","binance")
-                df.attrs["status"]="ok"; df.attrs["source"]="binance"; return df
-            except Exception:
-                return _empty("parse_binance","binance")
+    if not sym:
+        return _empty("no_route","")
 
-    # CG-Fallback erwartet CG-ID – für reine Symbole meist leer.
-    return _empty("no_route","")
+    kl = None
+    for base in BINANCE_ENDPOINTS:
+        try:
+            r = get_http().get(f"{base}/api/v3/klines",
+                               params={"symbol": sym, "interval":"1d", "limit":min(1000, int(days)+5)}, timeout=8)
+            if r.status_code != 200:
+                time.sleep(0.2); continue
+            data = r.json()
+            if isinstance(data, list) and data and isinstance(data[0], (list,tuple)):
+                kl = data; break
+        except Exception:
+            time.sleep(0.2); continue
+
+    if kl is None:
+        return _empty("err_binance","binance")
+
+    try:
+        df = pd.DataFrame(kl, columns=["openTime","open","high","low","close","volume","closeTime","qav","numTrades","takerBase","takerQuote","ignore"])
+        df["timestamp"] = pd.to_datetime(df["openTime"], unit="ms", utc=True, errors="coerce")
+        df["price"]     = pd.to_numeric(df["close"], errors="coerce")
+        df["volume"]    = pd.to_numeric(df["volume"], errors="coerce")
+        df = df[["timestamp","price","volume"]].dropna().sort_values("timestamp").tail(int(days)+1)
+        if df.empty: return _empty("empty_binance","binance")
+        df.attrs["status"]="ok"; df.attrs["source"]="binance"; return df
+    except Exception:
+        return _empty("parse_binance","binance")
 
 # ================= Analytics =================
 def calc_local_levels(dfd: pd.DataFrame, lookback: int = 20) -> Tuple[float,float]:
@@ -321,33 +326,31 @@ else:
         key="watchlist_top"
     )
     label_to_id = dict(zip(top_df["label"], top_df["id"]))
-    selected_ids = [label_to_id[l] for l in selected_labels]
+    selected_ids = [label_to_id.get(l, l) for l in selected_labels]
 
 manual = st.sidebar.text_input("Zusätzliche ID (optional, z.B. 'render-token' oder 'BTCUSDT')", value="", key="manual_id")
 if manual.strip(): selected_ids.append(manual.strip())
 if not selected_ids: selected_ids = ["bitcoin","ethereum"]
-
-# Persist
 st.session_state["selected_ids"] = selected_ids
 
 # Scan-Steuerung
 c_scan1, c_scan2 = st.sidebar.columns(2)
 scan_now_batch = c_scan1.button("🔔 Batch scannen", key="scan_btn_batch")
 scan_now_full  = c_scan2.button("🔁 Ganze Watchlist", key="scan_btn_full")
-
 batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 15, int(st.session_state["batch_size_slider"]), 1, key="batch_size_slider")
 if st.sidebar.button("🔄 Batch zurücksetzen", key="reset_batch_btn"):
     st.session_state["scan_index"] = 0
 
-st.caption("🔒 Passwortschutz aktiv • Scans: Batch oder komplette Watchlist • Tabellen: Filter pro Spalte (oben rechts im Editor).")
+st.caption("🔒 Passwortschutz aktiv • Scans: Batch oder komplette Watchlist • Tabellen: Filter pro Spalte (Editor-Toolbar).")
 
 # ================= Utility: Name/Symbol =================
 def _name_and_symbol_any(coin_id_or_symbol: str) -> Tuple[str,str]:
-    # Binance Symbol?
-    if coin_id_or_symbol.upper().endswith("USDT"):
+    if isinstance(coin_id_or_symbol, str) and coin_id_or_symbol.upper().endswith("USDT"):
         s = coin_id_or_symbol[:-4].upper()
         return s, s
     try:
+        if not isinstance(top_df, pd.DataFrame) or top_df.empty:
+            return coin_id_or_symbol, coin_id_or_symbol[:4].upper()
         row = top_df[top_df["id"]==coin_id_or_symbol]
         if not row.empty:
             return str(row.iloc[0]["name"]), str(row.iloc[0]["symbol"]).upper()
@@ -363,9 +366,11 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
                          progress_label: str = "Scanne …") -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     rows, history_cache = [], {}
     total = len(id_list)
+    if total == 0:
+        return pd.DataFrame(), {}
     prog  = st.progress(0, text=progress_label)
     note  = st.empty()
-    PAUSE_BETWEEN = 0.5
+    PAUSE_BETWEEN = 0.45
 
     for i, cid in enumerate(id_list, start=1):
         note.info(f"{progress_label}: {i}/{total} — {cid}")
@@ -423,35 +428,45 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
     prog.progress(1.0, text=f"{progress_label} (fertig)")
     note.empty()
     df = pd.DataFrame(rows)
-    df = df.sort_values("rank").reset_index(drop=True)
+    df = df.sort_values("rank", kind="stable").reset_index(drop=True)
     return df, history_cache
 
 def run_scan_batch():
     start = st.session_state.get("scan_index", 0)
-    end = min(start + int(st.session_state["batch_size_slider"]), len(selected_ids))
-    batch = selected_ids[start:end]
+    ids = list(st.session_state.get("selected_ids", []))
+    end = min(start + int(st.session_state["batch_size_slider"]), len(ids))
+    batch = ids[start:end]
     if not batch:
         st.warning("Keine Coins im aktuellen Batch. Batch zurücksetzen.")
         return pd.DataFrame(), {}
-    st.info(f"⏳ Batch {start+1}–{end} von {len(selected_ids)} …")
+    st.info(f"⏳ Batch {start+1}–{end} von {len(ids)} …")
     df, cache = compute_rows_for_ids(batch, days_hist, vol_surge_thresh, lookback_res, "Batch-Scan")
-    st.session_state["scan_index"] = end % max(1, len(selected_ids))
+    st.session_state["scan_index"] = end % max(1, len(ids))
     return df, cache
 
 def run_scan_full_watchlist():
     st.info("🔁 Scanne gesamte Watchlist …")
-    return compute_rows_for_ids(selected_ids, days_hist, vol_surge_thresh, lookback_res, "Watchlist-Scan")
+    ids = list(st.session_state.get("selected_ids", []))
+    return compute_rows_for_ids(ids, days_hist, vol_surge_thresh, lookback_res, "Watchlist-Scan")
 
+if st.session_state.get("signals_cache","") is None:
+    st.session_state["signals_cache"] = pd.DataFrame()
+if st.session_state.get("history_cache","") is None:
+    st.session_state["history_cache"] = {}
+
+# Aktionen
 if scan_now_batch:
     sig, hist_cache = run_scan_batch()
-    st.session_state["signals_cache"] = sig
+    if not sig.empty:
+        st.session_state["signals_cache"] = sig
     st.session_state["history_cache"].update(hist_cache)
 elif scan_now_full:
     sig, hist_cache = run_scan_full_watchlist()
-    st.session_state["signals_cache"] = sig
+    if not sig.empty:
+        st.session_state["signals_cache"] = sig
     st.session_state["history_cache"].update(hist_cache)
 
-signals_df = st.session_state["signals_cache"].copy()
+signals_df = st.session_state.get("signals_cache", pd.DataFrame()).copy()
 
 st.subheader("🔎 Signals & Levels — Watchlist")
 if not signals_df.empty:
@@ -459,38 +474,43 @@ if not signals_df.empty:
         if c in signals_df.columns:
             signals_df[c] = pd.to_numeric(signals_df[c], errors="coerce")
     view_df = signals_df.copy()
-    # Format
+    # Anzeigen formattieren (ID bleibt intern, wird aber nicht gerendert)
     view_df["price"]      = view_df["price"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
     view_df["MA20"]       = view_df["MA20"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
     view_df["MA50"]       = view_df["MA50"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
     view_df["Resistance"] = view_df["Resistance"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
     view_df["Support"]    = view_df["Support"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
     view_df["Vol_Surge_x"]= view_df["Vol_Surge_x"].map(lambda x: f"{x:.2f}x" if pd.notna(x) else "")
-    # Auswahlspalte (Radio) — schlankes 1-Klick-Äquivalent
-    view_df.insert(0, "▶", False)
+    # Auswahlspalte (Radio) – robust
+    if "▶" not in view_df.columns:
+        view_df.insert(0, "▶", False)
     sel = st.session_state.get("selected_coin")
-    if sel in set(signals_df["id"]):
-        view_df.loc[signals_df["id"]==sel, "▶"] = True
-    # Editor mit Filtern
+    if sel in set(signals_df["id"].astype(str)):
+        # setze erste Zeile mit diesem id auf True
+        try:
+            idx_first = signals_df.index[signals_df["id"].astype(str)==str(sel)][0]
+            view_df.loc[idx_first, "▶"] = True
+        except Exception:
+            pass
+
     edited = st.data_editor(
         view_df[["▶","rank","name","symbol","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]],
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "▶": st.column_config.RadioColumn(help="Klicken, um Coin zu aktivieren"),
-        },
+        column_config={"▶": st.column_config.RadioColumn(help="Klicken, um Coin zu aktivieren")},
         num_rows="fixed"
     )
-    # aktive Auswahl übernehmen
+
+    # Auswahl übernehmen (defensiv)
     try:
-        # erster True in Column ▶
-        if "▶" in edited:
-            idx = None
-            if isinstance(edited, pd.DataFrame):
-                t = edited[edited["▶"]==True]
-                if not t.empty: idx = t.index[0]
-            if idx is not None:
-                st.session_state["selected_coin"] = signals_df.iloc[idx]["id"]
+        chosen_idx: Optional[int] = None
+        if isinstance(edited, pd.DataFrame) and "▶" in edited.columns:
+            t = edited[edited["▶"] == True]
+            if not t.empty:
+                # wähle erste markierte Zeile
+                chosen_idx = t.index[0]
+        if chosen_idx is not None and chosen_idx in signals_df.index:
+            st.session_state["selected_coin"] = str(signals_df.loc[chosen_idx, "id"])
     except Exception:
         pass
 
@@ -515,19 +535,25 @@ def load_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> p
         st.warning("Binance Top-100 nicht verfügbar. Fallback BTC/ETH/SOL.")
         top = pd.DataFrame({
             "rank":[1,2,3],
+            "id":["BTCUSDT","ETHUSDT","SOLUSDT"],
             "symbol":["BTCUSDT","ETHUSDT","SOLUSDT"],
             "name":["BTC","ETH","SOL"],
             "symbol2":["BTC","ETH","SOL"],
             "quoteVolume":[0,0,0]
         })
-    ids = top["symbol"].tolist()
-    names = {r["symbol"]:(str(r["name"]), str(r["symbol2"])) for _, r in top.iterrows()}
+    ids = top["id"].tolist()
+    names = {r["id"]:(str(r["name"]), str(r["symbol2"])) for _, r in top.iterrows()}
+
     df100, cache = compute_rows_for_ids(ids, days_hist, vol_surge_thresh, lookback_res, "Top-100-Scan")
-    df100["rank"] = df100["id"].map(lambda x: int(top[top["symbol"]==x]["rank"].iloc[0]) if x in set(top["symbol"]) else 999)
+    if df100.empty:
+        return df100
+    # Rank/Name/Symbol zurück aufprägen (falls Reihenfolge anders)
+    df100["rank"] = df100["id"].map(lambda x: int(top[top["id"]==x]["rank"].iloc[0]) if x in set(top["id"]) and not top[top["id"]==x].empty else 999)
     df100["name"] = df100["id"].map(lambda x: names.get(x, (x,x))[0])
     df100["symbol"] = df100["id"].map(lambda x: names.get(x, (x,x))[1])
+
     st.session_state["history_cache"].update(cache)
-    return df100.sort_values("rank").reset_index(drop=True)
+    return df100.sort_values("rank", kind="stable").reset_index(drop=True)
 
 do_load = refresh_btn or (auto_refresh and (time.time() - st.session_state["top100_cache_ts"] > 120)) or st.session_state["top100_df"].empty
 if do_load:
@@ -536,14 +562,14 @@ if do_load:
         st.session_state["top100_df"] = df100
         st.session_state["top100_cache_ts"] = time.time()
 
-top100_df = st.session_state["top100_df"].copy()
+top100_df = st.session_state.get("top100_df", pd.DataFrame()).copy()
 
-selected_coin_from_table = None
 if not top100_df.empty:
     if top_filter == "Nur Entry-Signal (Top-100)":
         top100_view = top100_df[(top100_df["Entry_Signal"] == True) & (top100_df["status"] == "ok")].copy()
     elif top_filter == "Nur Watchlist":
-        wl = set(selected_ids); top100_view = top100_df[top100_df["id"].isin(wl)].copy()
+        wl = set(st.session_state.get("selected_ids", []))
+        top100_view = top100_df[top100_df["id"].isin(wl)].copy()
     else:
         top100_view = top100_df.copy()
 
@@ -551,40 +577,46 @@ if not top100_df.empty:
         if c in top100_view.columns:
             top100_view[c] = pd.to_numeric(top100_view[c], errors="coerce")
 
-    # Radio-Select Spalte
-    top100_view.insert(0, "▶", False)
+    if "▶" not in top100_view.columns:
+        top100_view.insert(0, "▶", False)
     prev = st.session_state.get("selected_coin")
-    if prev in set(top100_view["id"]):
-        top100_view.loc[top100_view["id"]==prev, "▶"] = True
+    if prev in set(top100_view["id"].astype(str)):
+        try:
+            top100_view.loc[top100_view["id"].astype(str)==str(prev), "▶"] = True
+        except Exception:
+            pass
 
-    top100_view = top100_view.sort_values("rank").reset_index(drop=True)
+    top100_view = top100_view.sort_values("rank", kind="stable").reset_index(drop=True)
+
     edited_top = st.data_editor(
         top100_view[["▶","rank","name","symbol","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]],
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "▶": st.column_config.RadioColumn(help="Klicken, um Coin zu aktivieren"),
-        },
+        column_config={"▶": st.column_config.RadioColumn(help="Klicken, um Coin zu aktivieren")},
         num_rows="fixed"
     )
+
+    # Auswahl übernehmen (defensiv; mapping über rank)
     try:
-        if isinstance(edited_top, pd.DataFrame):
-            t = edited_top[edited_top["▶"]==True]
+        chosen_idx = None
+        if isinstance(edited_top, pd.DataFrame) and "▶" in edited_top.columns:
+            t = edited_top[edited_top["▶"] == True]
             if not t.empty:
-                # finde die ID über rank+name
-                rnk = int(t.iloc[0]["rank"])
-                row = top100_df[top100_df["rank"]==rnk]
-                if not row.empty:
-                    st.session_state["selected_coin"] = row.iloc[0]["id"]
+                chosen_idx = t.index[0]
+        if chosen_idx is not None and chosen_idx in top100_view.index:
+            chosen_rank = int(top100_view.loc[chosen_idx, "rank"])
+            row = top100_df[top100_df["rank"] == chosen_rank]
+            if not row.empty and "id" in row.columns:
+                st.session_state["selected_coin"] = str(row.iloc[0]["id"])
     except Exception:
         pass
 else:
-    st.info("Noch keine Top-100 Daten. Klicke auf „Top-100 aktualisieren“ oder aktiviere Auto-Refresh.")
+    st.info("Noch keine Top-100 Daten. „Top-100 aktualisieren“ klicken oder Auto-Refresh aktivieren.")
 
 # ================= Badge aktiver Coin & Einzel-Chart =================
 st.markdown("---")
 
-active = st.session_state.get("selected_coin") or (selected_ids[0] if selected_ids else None)
+active = st.session_state.get("selected_coin") or (st.session_state.get("selected_ids",[None])[0])
 if active:
     name_badge, sym_badge = _name_and_symbol_any(active)
     st.markdown(
@@ -626,7 +658,7 @@ if active:
             d_daily["entry_flag"] = (d_daily["price"] > d_daily["ma20"]) & (d_daily["ma20"] > d_daily["ma50"]) & \
                                     (d_daily["price"] > d_daily["roll_max_prev"]) & \
                                     (d_daily["vol_ratio"] >= st.session_state["vol_surge_thresh"])
-            entries = d_daily[daily_mask:=d_daily["entry_flag"]]
+            entries = d_daily[d_daily["entry_flag"]]
 
             fig, ax_price = plt.subplots()
             ax_vol = ax_price.twinx()
