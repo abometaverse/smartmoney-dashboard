@@ -1,8 +1,8 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v3.1  (Binance-first + CG fallback, Top-100 von Binance, Fortschritt,
-#       Table-driven Chart, historische Entry-Dots, sauberes Money-Format)
+# v3.2  (Top-100: Binance-only & robust; Multi-endpoint; Dummy-Fallback,
+#       Fortschritt, Table-driven Chart mit Entry-Dots, sauberes Money-Format)
 #
 # Secrets (Streamlit → Advanced settings → Secrets):
 # APP_PASSWORD = "DeinStarkesPasswort"
@@ -80,12 +80,18 @@ auth_gate()
 
 # ================= Constants & HTTP =================
 FIAT = "usd"
-CG_BASE = "https://api.coingecko.com/api/v3"
+CG_BASE = "https://api.coingecko.com/api/v3"  # nur noch als Fallback für Historie/Snapshot
+
+BINANCE_ENDPOINTS = [
+    "https://api.binance.com",
+    "https://data-api.binance.vision",
+    "https://api.binance.us",
+]
 
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/3.1 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/3.2 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -125,30 +131,69 @@ def fmt_money(n: float, decimals: int = 2) -> str:
 def ma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=max(2, window//2)).mean()
 
-# ---------- Binance helpers ----------
+# ---------- Binance helpers (robust multi-endpoint) ----------
+def _binance_first_ok(path: str, params: Dict=None, timeout: int=10):
+    sess = get_http()
+    last_err = None
+    for base in BINANCE_ENDPOINTS:
+        url = f"{base}{path}"
+        try:
+            r = sess.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            last_err = r.status_code
+            time.sleep(0.25)
+        except requests.RequestException:
+            last_err = "req"
+            time.sleep(0.25)
+    raise RuntimeError(f"binance_fail:{last_err}")
+
 @st.cache_data(ttl=900, show_spinner=False)
 def binance_exchange_info() -> pd.DataFrame:
-    r = _get_json("https://api.binance.com/api/v3/exchangeInfo")
-    if not r.get("ok"): return pd.DataFrame()
-    df = pd.DataFrame(r["json"]["symbols"])
-    # nur handelbare USDT-Spot-Paare
-    df = df[(df["quoteAsset"]=="USDT") & (df["status"]=="TRADING") & (~df["symbol"].str.contains("UP|DOWN|BULL|BEAR"))]
+    try:
+        js = _binance_first_ok("/api/v3/exchangeInfo")
+    except Exception:
+        return pd.DataFrame()
+    df = pd.DataFrame(js.get("symbols", []))
+    if df.empty: return df
+    df = df[(df["quoteAsset"]=="USDT") & (df["status"]=="TRADING")]
+    # keine gehebelten/Leveraged Tokens
+    mask = ~df["symbol"].str.contains(r"(UP|DOWN|BULL|BEAR)", regex=True)
+    df = df[mask]
     return df[["symbol","baseAsset","quoteAsset"]].copy()
 
 @st.cache_data(ttl=300, show_spinner=False)
+def binance_ticker_24hr() -> pd.DataFrame:
+    """Kombiniert 24h-Ticker über mehrere Endpoints, gibt DataFrame zurück."""
+    frames = []
+    for base in BINANCE_ENDPOINTS:
+        try:
+            url = f"{base}/api/v3/ticker/24hr"
+            r = get_http().get(url, timeout=8)
+            if r.status_code == 200:
+                frames.append(pd.DataFrame(r.json()))
+                break
+        except Exception:
+            time.sleep(0.2); continue
+    if not frames: return pd.DataFrame()
+    return frames[0]
+
+@st.cache_data(ttl=300, show_spinner=False)
 def binance_top100_by_quote_volume() -> pd.DataFrame:
-    """Top nach Quote-Volumen (24h), nur USDT-Spot. Gibt symbol, baseAsset zurück."""
+    """Top-100 nach Quote-Volumen (24h), nur USDT-Spot, robust."""
     info = binance_exchange_info()
     if info.empty: return pd.DataFrame()
-    r = _get_json("https://api.binance.com/api/v3/ticker/24hr")
-    if not r.get("ok"): return pd.DataFrame()
-    t = pd.DataFrame(r["json"])
-    t = t.merge(info, on="symbol", how="inner")
-    t["quoteVolume"] = pd.to_numeric(t["quoteVolume"], errors="coerce")
-    t = t.sort_values("quoteVolume", ascending=False).head(100)
-    return t[["symbol","baseAsset","quoteVolume"]].reset_index(drop=True)
+    t = binance_ticker_24hr()
+    if t.empty: return pd.DataFrame()
+    # nur USDT-Spot-Paare
+    df = t.merge(info, on="symbol", how="inner")
+    # numeric
+    df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce")
+    df = df.sort_values("quoteVolume", ascending=False)
+    df = df.head(100).reset_index(drop=True)
+    return df[["symbol","baseAsset","quoteVolume"]]
 
-# ---------- CoinGecko helpers ----------
+# ---------- CoinGecko helpers (nur für Snapshot/Detail-Fallback) ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def cg_top_coins(limit: int = 500) -> pd.DataFrame:
     rows = []; per_page = 250; pages = int(np.ceil(limit / per_page))
@@ -181,40 +226,31 @@ def cg_simple_price(ids: List[str]) -> pd.DataFrame:
 @st.cache_data(ttl=1200, show_spinner=False)
 def load_history(coin_or_symbol: str, days: int = 180) -> pd.DataFrame:
     """Wenn coin_or_symbol wie 'BTCUSDT' aussieht -> direkt Binance.
-       Sonst: erst Binance über Mapping, dann CG fallback."""
+       Sonst: versuche Binance-Mapping über baseAsset; wenn das nicht klappt -> CG-Fallback."""
     def _empty(status_text: str, source: str = "") -> pd.DataFrame:
         df = pd.DataFrame(columns=["timestamp","price","volume"])
         df.attrs["status"] = status_text
         if source: df.attrs["source"] = source
         return df
 
-    # 1) Wenn direkt ein Binance-Symbol (USDT)
     sym = None
     if coin_or_symbol.upper().endswith("USDT") and coin_or_symbol.isascii():
         sym = coin_or_symbol.upper()
-
-    # 2) Falls es eine CG-ID ist -> versuch Symbol-Mapping
     if not sym:
         try:
             info = binance_exchange_info()
-            # naive Heuristik: suche baseAsset, der der id/symbol ähnlich ist
             base = coin_or_symbol.upper()
             row = info[(info["baseAsset"]==base)]
             if not row.empty: sym = row.iloc[0]["symbol"]
         except Exception:
             pass
 
-    # ---------- Binance ----------
     if sym:
-        endpoints = [
-            "https://api.binance.com/api/v3/klines",
-            "https://data-api.binance.vision/api/v3/klines",
-            "https://api.binance.us/api/v3/klines",
-        ]
         kl = None; last_status = None
-        for base in endpoints:
+        for base in BINANCE_ENDPOINTS:
             try:
-                r = get_http().get(base, params={"symbol": sym, "interval":"1d", "limit":min(1000, int(days)+5)}, timeout=8)
+                r = get_http().get(f"{base}/api/v3/klines",
+                                   params={"symbol": sym, "interval":"1d", "limit":min(1000, int(days)+5)}, timeout=8)
                 last_status = r.status_code
                 if r.status_code != 200: time.sleep(0.2); continue
                 data = r.json()
@@ -222,8 +258,7 @@ def load_history(coin_or_symbol: str, days: int = 180) -> pd.DataFrame:
                     kl = data; break
             except Exception:
                 time.sleep(0.2); continue
-        if kl is None: 
-            # Binance schlug fehl -> CG als Fallback (wenn coin_or_symbol CG-ID ist)
+        if kl is None:
             pass
         else:
             try:
@@ -237,7 +272,7 @@ def load_history(coin_or_symbol: str, days: int = 180) -> pd.DataFrame:
             except Exception:
                 return _empty("parse_binance","binance")
 
-    # ---------- CoinGecko Fallback ----------
+    # --- CG fallback (nur wenn ID eine CG-ID ist) ---
     resp = _get_json(
         f"{CG_BASE}/coins/{coin_or_symbol}/market_chart",
         {"vs_currency": FIAT, "days": days, "interval": "daily"},
@@ -309,10 +344,10 @@ for k, v in {
 
 days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15, key="days_hist")
 
-# Watchlist (aus CG – wegen Namensanzeige & Suche angenehm)
+# Watchlist (CG für komfortable Suche; wenn CG ausfällt → Fallback IDs)
 top_df = cg_top_coins(limit=500)
 if top_df.empty:
-    st.sidebar.warning("Top-Liste (CG) konnte nicht geladen werden (Limit?). Fallback.")
+    st.sidebar.warning("Top-Liste (CG) konnte nicht geladen werden. Fallback.")
     default_ids = ["bitcoin","ethereum","solana","arbitrum","render-token","bittensor"]
     selected_labels = st.sidebar.multiselect(
         "Watchlist (Fallback)",
@@ -387,15 +422,17 @@ if "signals_cache" not in st.session_state: st.session_state["signals_cache"] = 
 if "history_cache" not in st.session_state: st.session_state["history_cache"] = {}
 
 def _name_and_symbol(coin_id: str) -> Tuple[str,str]:
-    """Versucht Name+Symbol aus CG-Top500; für Binance-Symbole (XYZUSDT) wird XYZ zurückgegeben."""
+    """Name/Symbol-Anzeige. Für Binance-Symbole (XYZUSDT) -> (XYZ, XYZ)."""
     if coin_id.upper().endswith("USDT"):
         sym = coin_id[:-4].upper()
         return sym, sym
-    if not top_df.empty:
+    # aus CG-Top500, falls vorhanden:
+    try:
         row = top_df[top_df["id"]==coin_id]
         if not row.empty:
             return row.iloc[0]["name"], str(row.iloc[0]["symbol"]).upper()
-    # Fallback: id -> NAME
+    except Exception:
+        pass
     return coin_id, coin_id[:4].upper()
 
 def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, lookback: int,
@@ -514,9 +551,9 @@ if not signals_df.empty:
     display_df = display_df[["name","symbol","id","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]]
     st.dataframe(display_df.style.apply(_row_style, axis=1), use_container_width=True, hide_index=True)
 
-# ================= Detail & Risk — Top-100 =================
+# ================= Detail & Risk — Top-100 (Binance-only) =================
 st.markdown("---")
-st.subheader("📈 Detail & Risk — Top-100 Universum")
+st.subheader("📈 Detail & Risk — Top-100 Universum (Binance)")
 
 st.session_state.setdefault("top100_df", pd.DataFrame())
 st.session_state.setdefault("top100_cache_ts", 0.0)
@@ -530,42 +567,26 @@ with c3:
     top_filter = st.radio("Filter", ["Alle (Top-100)", "Nur Entry-Signal (Top-100)", "Nur Watchlist"], index=0, horizontal=True)
 
 def load_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> pd.DataFrame:
-    # 1) Versuch Binance (quoteVolume)
     top = binance_top100_by_quote_volume()
-    ids: List[str]
-    names: Dict[str, Tuple[str,str]] = {}
-    if not top.empty:
-        ids = top["symbol"].tolist()          # z.B. BTCUSDT
-        for _, r in top.iterrows():
-            base = str(r["baseAsset"]).upper()
-            names[r["symbol"]] = (base, base) # Name, Symbol (keine schönen Namen verfügbar)
-    else:
-        # 2) Fallback CG (Top Marketcap)
-        cg = cg_top_coins(limit=100)
-        ids = cg["id"].tolist() if not cg.empty else []
-        for _, r in cg.iterrows():
-            names[r["id"]] = (r["name"], str(r["symbol"]).upper())
+    if top.empty:
+        # Dummy-Fallback, falls Binance ebenfalls blockt
+        st.warning("Binance Top-100 nicht verfügbar. Verwende Dummy-Fallback (BTC/ETH/SOL).")
+        top = pd.DataFrame({"symbol":["BTCUSDT","ETHUSDT","SOLUSDT"], "baseAsset":["BTC","ETH","SOL"], "quoteVolume":[0,0,0]})
 
-    if not ids:
-        st.warning("Konnte Top-100 nicht laden.")
-        return pd.DataFrame()
+    ids = top["symbol"].tolist()
+    names = {r["symbol"]:(str(r["baseAsset"]).upper(), str(r["baseAsset"]).upper()) for _, r in top.iterrows()}
 
     df100, cache = compute_rows_for_ids(ids, days_hist, vol_surge_thresh, lookback_res, "Top-100-Scan")
-    # Namen/Symbole einsetzen (für Binance-Symbole sinnvoll)
-    if "name" not in df100.columns or "symbol" not in df100.columns:
-        df100["name"] = df100["id"].map(lambda x: names.get(x, (x, x))[0])
-        df100["symbol"] = df100["id"].map(lambda x: names.get(x, (x, x))[1])
-    else:
-        # sicherheitshalber überschreiben, wenn mapping existiert
-        df100["name"] = df100.apply(lambda r: names.get(r["id"], (r["name"], r["symbol"]))[0], axis=1)
-        df100["symbol"] = df100.apply(lambda r: names.get(r["id"], (r["name"], r["symbol"]))[1], axis=1)
-    # Historiencache übernehmen
+    # Name + Symbol sauber setzen
+    df100["name"]   = df100["id"].map(lambda x: names.get(x, (x,x))[0])
+    df100["symbol"] = df100["id"].map(lambda x: names.get(x, (x,x))[1])
+
     st.session_state["history_cache"].update(cache)
     return df100
 
 do_load = refresh_btn or (auto_refresh and (time.time() - st.session_state["top100_cache_ts"] > 120)) or st.session_state["top100_df"].empty
 if do_load:
-    df100 = load_top100(st.session_state["days_hist"], vol_surge_thresh, lookback_res)
+    df100 = load_top100(st.session_state["days_hist"], st.session_state["vol_surge_thresh"], st.session_state["lookback_res"])
     if not df100.empty:
         st.session_state["top100_df"] = df100
         st.session_state["top100_cache_ts"] = time.time()
@@ -583,7 +604,6 @@ if not top100_df.empty:
     else:
         top100_view = top100_df.copy()
 
-    # Format + Checkboxspalte
     top100_view = top100_view.sort_values(["Entry_Signal","id"], ascending=[False, True]).reset_index(drop=True)
     if "View" not in top100_view.columns:
         top100_view["View"] = False
@@ -594,7 +614,6 @@ if not top100_df.empty:
     elif not top100_view.empty:
         top100_view.loc[0, "View"] = True
 
-    # Anzeige
     show_cols = ["View","name","symbol","id","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]
     for c in ["price","MA20","MA50","Resistance","Support","Vol_Surge_x"]:
         if c in top100_view.columns:
@@ -610,7 +629,6 @@ if not top100_df.empty:
         key="top100_editor"
     )
 
-    # Auswahl ermitteln (erste Zeile mit View==True)
     current_view_df = st.session_state["top100_editor"]["data"] if "data" in st.session_state["top100_editor"] else top100_view.to_dict("records")
     for row in current_view_df:
         if row.get("View", False):
@@ -654,7 +672,6 @@ if coin_select:
         if d_daily.empty:
             st.warning("Keine Tagesdaten.")
         else:
-            # Levels, Signale & historische Entry-Punkte
             r, s  = calc_local_levels(d_daily, lookback_res)
             d_daily["ma20"] = ma(d_daily["price"], 20)
             d_daily["ma50"] = ma(d_daily["price"], 50)
@@ -663,8 +680,8 @@ if coin_select:
             d_daily["roll_max_prev"] = d_daily["price"].shift(1).rolling(lookback_res, min_periods=5).max()
             d_daily["entry_flag"] = (d_daily["price"] > d_daily["ma20"]) & (d_daily["ma20"] > d_daily["ma50"]) & \
                                     (d_daily["price"] > d_daily["roll_max_prev"]) & \
-                                    (d_daily["vol_ratio"] >= vol_surge_thresh)
-            entries = d_daily[daily_mask := d_daily["entry_flag"]]
+                                    (d_daily["vol_ratio"] >= st.session_state["vol_surge_thresh"])
+            entries = d_daily[d_daily["entry_flag"]]
 
             fig, ax_price = plt.subplots()
             ax_vol = ax_price.twinx()
@@ -675,15 +692,12 @@ if coin_select:
             if not np.isnan(r): ax_price.axhline(r, linestyle="--", label=f"Resistance {r:.3f}")
             if not np.isnan(s): ax_price.axhline(s, linestyle="--", label=f"Support {s:.3f}")
 
-            # historische Entry-Punkte (grün)
             if not entries.empty:
                 ax_price.scatter(entries.index, entries["price"], s=36, zorder=5, color="#16a34a", label="Entry (hist)")
 
-            # Volumen als Balken (rechts)
             ax_vol.bar(d_daily.index, d_daily["volume"], alpha=0.28)
             ax_vol.set_ylabel("Volume")
 
-            # Datum gut lesbar
             locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
             formatter = mdates.ConciseDateFormatter(locator)
             ax_price.xaxis.set_major_locator(locator)
