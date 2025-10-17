@@ -15,8 +15,11 @@
 # APP_URL            = "https://deine-app-url.streamlit.app"  # optional
 # -------------------------------------------------------------
 
+import json
 import math
+import sqlite3
 import time
+from pathlib import Path
 from typing import Tuple, Dict, List, Optional
 
 import requests
@@ -30,6 +33,7 @@ import streamlit as st
 st.set_page_config(page_title="Smart Money Dashboard — Geschützt", layout="wide")
 
 # ================= Session Helpers =================
+
 PERSIST_KEYS = [
     "selected_ids","vol_surge_thresh","lookback_res","alerts_enabled",
     "days_hist","batch_size_slider","scan_index","selected_coin",
@@ -37,12 +41,82 @@ PERSIST_KEYS = [
     "auto_scan_enabled","auto_scan_hours","auto_last_ts","auto_alerted_ids"
 ]
 
+SETTINGS_DB_KEYS = [
+    "selected_ids","vol_surge_thresh","lookback_res","alerts_enabled",
+    "days_hist","batch_size_slider","scan_index","selected_coin",
+    "top100_last_sync_ts","top100_cooldown_min",
+    "auto_scan_enabled","auto_scan_hours","auto_last_ts","auto_alerted_ids"
+]
+
+SETTINGS_DB_PATH = Path(__file__).with_name("dashboard_settings.db")
+TABLE_DOUBLECLICK_WINDOW = 0.75  # Sekundenfenster für Doppel-Klick-Erkennung
+
+
+def _init_settings_db():
+    try:
+        with sqlite3.connect(SETTINGS_DB_PATH) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+def _load_settings_from_db(keys: List[str]) -> Dict[str, object]:
+    if not keys:
+        return {}
+    _init_settings_db()
+    placeholders = ",".join(["?"] * len(keys))
+    result: Dict[str, object] = {}
+    try:
+        with sqlite3.connect(SETTINGS_DB_PATH) as conn:
+            rows = conn.execute(
+                f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+                keys,
+            ).fetchall()
+    except sqlite3.Error:
+        return result
+    for key, raw_value in rows:
+        try:
+            result[key] = json.loads(raw_value)
+        except json.JSONDecodeError:
+            continue
+    return result
+
+
+def persist_settings(keys: List[str]) -> None:
+    if not keys:
+        return
+    _init_settings_db()
+    try:
+        with sqlite3.connect(SETTINGS_DB_PATH) as conn:
+            for key in keys:
+                if key not in st.session_state:
+                    continue
+                value = st.session_state[key]
+                try:
+                    payload = json.dumps(value)
+                except TypeError:
+                    continue
+                conn.execute(
+                    "REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    (key, payload),
+                )
+            conn.commit()
+    except sqlite3.Error:
+        pass
+
 def save_state(keys):
+    persist_settings([k for k in keys if k in SETTINGS_DB_KEYS])
     for k in keys:
         if k in st.session_state:
             st.session_state[f"_saved_{k}"] = st.session_state[k]
 
 def restore_state(keys):
+    db_values = _load_settings_from_db([k for k in keys if k in SETTINGS_DB_KEYS])
+    for k, v in db_values.items():
+        st.session_state[k] = v
     for k in keys:
         saved_key = f"_saved_{k}"
         if saved_key in st.session_state:
@@ -77,6 +151,47 @@ def ensure_defaults():
 def set_active_coin(coin_id: str, source: str):
     st.session_state["selected_coin"] = str(coin_id)
     st.session_state["last_selection_source"] = source
+
+
+def _selection_action(selection: Dict) -> str:
+    if not isinstance(selection, dict):
+        return ""
+    for key in ("action", "type", "mode"):
+        val = selection.get(key)
+        if isinstance(val, str):
+            return val.lower()
+    return ""
+
+
+def handle_table_select():
+    selection_state = st.session_state.get("combined_table", {})
+    selection = selection_state.get("selection") if isinstance(selection_state, dict) else None
+    rows = selection.get("rows") if isinstance(selection, dict) else []
+    if not rows:
+        return
+
+    idx = rows[0]
+    id_map = st.session_state.get("_table_id_map", [])
+    if not (0 <= idx < len(id_map)):
+        return
+
+    now = time.time()
+    action = _selection_action(selection)
+    last_click = st.session_state.get("_last_table_click")
+    last_idx = last_click.get("idx") if isinstance(last_click, dict) else None
+    last_ts = float(last_click.get("ts", 0.0)) if isinstance(last_click, dict) else 0.0
+
+    double_click = action in {"doubleclick", "double_click", "dataframe.doubleclick"}
+    if not double_click and last_idx == idx and (now - last_ts) <= TABLE_DOUBLECLICK_WINDOW:
+        double_click = True
+
+    st.session_state["_last_table_click"] = {"idx": idx, "ts": now}
+
+    if not double_click:
+        return
+
+    set_active_coin(id_map[idx], source="table")
+    st.rerun()
 
 # ================= Auth Gate =================
 def auth_gate() -> None:
@@ -362,8 +477,8 @@ st.sidebar.header("Settings")
 
 # Slider mit Keys (persistieren automatisch)
 days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15, key="days_hist")
-vol_surge_thresh = st.sidebar.slider("Vol Surge vs 7d (x)", 1.0, 5.0, float(st.session_state["vol_surge_thresh"]), 0.1, key="vol_surge")
-lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 60, int(st.session_state["lookback_res"]), 1, key="lookback")
+vol_surge_thresh = st.sidebar.slider("Vol Surge vs 7d (x)", 1.0, 5.0, float(st.session_state["vol_surge_thresh"]), 0.1, key="vol_surge_thresh")
+lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 60, int(st.session_state["lookback_res"]), 1, key="lookback_res")
 
 # Refresh-Cooldown & Auto-Scan
 st.session_state["top100_cooldown_min"] = st.sidebar.number_input(
@@ -551,45 +666,6 @@ if scan_now_full:
         signals_df = sig
     st.session_state["history_cache"].update(hist_cache)
 
-# ---- Watchlist Tabelle
-st.subheader("🔎 Signals & Levels — Watchlist")
-if not signals_df.empty:
-    for c in ["price","MA20","MA50","Resistance","Support","Vol_Surge_x"]:
-        if c in signals_df.columns:
-            signals_df[c] = pd.to_numeric(signals_df[c], errors="coerce")
-    view_df = signals_df.copy()
-    view_df["price"]      = view_df["price"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-    view_df["MA20"]       = view_df["MA20"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-    view_df["MA50"]       = view_df["MA50"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-    view_df["Resistance"] = view_df["Resistance"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-    view_df["Support"]    = view_df["Support"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
-    view_df["Vol_Surge_x"]= view_df["Vol_Surge_x"].map(lambda x: f"{x:.2f}x" if pd.notna(x) else "")
-
-    if "▶" not in view_df.columns:
-        view_df.insert(0, "▶", False)
-    active_coin = str(st.session_state.get("selected_coin", ""))
-    # genau ein TRUE vorinitialisieren
-    view_df["▶"] = (signals_df["id"].astype(str) == active_coin).reindex(view_df.index, fill_value=False)
-
-    edited = st.data_editor(
-        view_df[["▶","rank","name","symbol","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]],
-        use_container_width=True,
-        hide_index=True,
-        column_config={"▶": st.column_config.CheckboxColumn(help="Ein Klick aktiviert den Coin (nur einer gleichzeitig).")},
-        num_rows="fixed"
-    )
-    try:
-        chosen_idx: Optional[int] = None
-        if isinstance(edited, pd.DataFrame) and "▶" in edited.columns:
-            t = edited[edited["▶"] == True]
-            if not t.empty:
-                chosen_idx = t.index[0]
-        if chosen_idx is not None and chosen_idx in signals_df.index:
-            set_active_coin(signals_df.loc[chosen_idx, "id"], source="watchlist")
-            st.rerun()
-    except Exception:
-        pass
-
 # ================= Top-100 — EIN Block =================
 st.markdown("---")
 st.subheader("📈 Detail & Risk — Top-100 (Binance)")
@@ -605,7 +681,7 @@ with c2:
     last_sync_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.session_state["top100_last_sync_ts"])) if st.session_state["top100_last_sync_ts"] else "—"
     st.write(f"Letzte Sync: {last_sync_str}")
 
-top_filter = st.radio("Filter", ["Alle (Top-100)", "Nur Entry-Signal (Top-100)", "Nur Watchlist"], index=0, horizontal=True, key="top100_filter")
+
 
 def load_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> pd.DataFrame:
     top = binance_top100_by_quote_volume()
@@ -632,6 +708,7 @@ def load_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> p
     st.session_state["history_cache"].update(cache)
     return df100.sort_values("rank", kind="stable").reset_index(drop=True)
 
+
 now = time.time()
 cooldown = int(st.session_state["top100_cooldown_min"]) * 60
 should_refresh = refresh_btn and (now - st.session_state["top100_last_sync_ts"] >= cooldown)
@@ -648,49 +725,90 @@ if should_refresh or st.session_state["top100_df"].empty:
 
 top100_df = st.session_state.get("top100_df", pd.DataFrame()).copy()
 
+st.markdown("---")
+st.subheader("📊 Übersicht — Watchlist & Top-100")
+
+filter_options = ["Alle", "Nur Watchlist", "Nur Top-100", "Nur Entry-Signale"]
+table_filter = st.radio("Filter", filter_options, index=0, horizontal=True, key="combined_table_filter")
+
+combined_frames: List[pd.DataFrame] = []
+if not signals_df.empty:
+    wl_df = signals_df.copy()
+    for col in ["price","MA20","MA50","Resistance","Support","Vol_Surge_x"]:
+        if col in wl_df.columns:
+            wl_df[col] = pd.to_numeric(wl_df[col], errors="coerce")
+    wl_df["origin"] = "Watchlist"
+    combined_frames.append(wl_df)
+
 if not top100_df.empty:
-    if top_filter == "Nur Entry-Signal (Top-100)":
-        top100_view = top100_df[(top100_df["Entry_Signal"] == True) & (top100_df["status"] == "ok")].copy()
-    elif top_filter == "Nur Watchlist":
-        wl_raw = set(st.session_state.get("selected_ids", []))
-        wl_mapped = set(filter(None, [resolve_to_binance_symbol(x) for x in wl_raw]))
-        top100_view = top100_df[top100_df["id"].isin(wl_mapped)].copy()
+    t_df = top100_df.copy()
+    for col in ["price","MA20","MA50","Resistance","Support","Vol_Surge_x"]:
+        if col in t_df.columns:
+            t_df[col] = pd.to_numeric(t_df[col], errors="coerce")
+    t_df["origin"] = "Top-100"
+    combined_frames.append(t_df)
+
+if combined_frames:
+    combined_df = pd.concat(combined_frames, ignore_index=True, sort=False)
+    combined_df = combined_df.drop_duplicates(subset=["id"], keep="first")
+
+    if table_filter == "Nur Watchlist":
+        filtered_df = combined_df[combined_df["origin"] == "Watchlist"].copy()
+    elif table_filter == "Nur Top-100":
+        filtered_df = combined_df[combined_df["origin"] == "Top-100"].copy()
+    elif table_filter == "Nur Entry-Signale":
+        filtered_df = combined_df[(combined_df["Entry_Signal"] == True) & (combined_df["status"] == "ok")].copy()
     else:
-        top100_view = top100_df.copy()
+        filtered_df = combined_df.copy()
 
-    for c in ["price","MA20","MA50","Resistance","Support","Vol_Surge_x"]:
-        if c in top100_view.columns:
-            top100_view[c] = pd.to_numeric(top100_view[c], errors="coerce")
+    if "rank" in filtered_df.columns:
+        filtered_df = filtered_df.sort_values(["rank","name"], kind="stable")
+    else:
+        filtered_df = filtered_df.sort_values("name", kind="stable")
 
-    if "▶" not in top100_view.columns:
-        top100_view.insert(0, "▶", False)
-    prev = st.session_state.get("selected_coin")
-    top100_view["▶"] = (top100_view["id"].astype(str) == str(prev))
+    filtered_df = filtered_df.reset_index(drop=True)
 
-    edited_top = st.data_editor(
-        top100_view[["▶","rank","name","symbol","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]],
-        use_container_width=True,
-        hide_index=True,
-        column_config={"▶": st.column_config.CheckboxColumn(help="Ein Klick aktiviert den Coin (nur einer gleichzeitig).")},
-        num_rows="fixed",
-        key="top100_editor"
-    )
-
-    try:
-        chosen_idx = None
-        if isinstance(edited_top, pd.DataFrame) and "▶" in edited_top.columns:
-            t = edited_top[edited_top["▶"] == True]
-            if not t.empty:
-                chosen_idx = t.index[0]
-        if chosen_idx is not None and chosen_idx in edited_top.index:
-            # Hier aus edited_top die ID abgreifen
-            chosen_id = str(edited_top.loc[chosen_idx, "id"])
-            set_active_coin(chosen_id, source="top100")
-            st.rerun()
-    except Exception:
-        pass
+    if filtered_df.empty:
+        st.info("Keine Datensätze für den ausgewählten Filter.")
+    else:
+        st.session_state["_table_id_map"] = filtered_df["id"].astype(str).tolist()
+        display_columns = [
+            "rank","origin","name","symbol","id","price","MA20","MA50","Vol_Surge_x",
+            "Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"
+        ]
+        available_columns = [c for c in display_columns if c in filtered_df.columns]
+        column_config = {
+            "price": st.column_config.NumberColumn("Price", format="%.4f"),
+            "MA20": st.column_config.NumberColumn("MA20", format="%.4f"),
+            "MA50": st.column_config.NumberColumn("MA50", format="%.4f"),
+            "Resistance": st.column_config.NumberColumn("Resistance", format="%.4f"),
+            "Support": st.column_config.NumberColumn("Support", format="%.4f"),
+            "Vol_Surge_x": st.column_config.NumberColumn("Vol Surge x", format="%.2f"),
+            "Breakout_MA": st.column_config.BooleanColumn("Breakout MA"),
+            "Breakout_Resistance": st.column_config.BooleanColumn("Breakout Resistance"),
+            "Distribution_Risk": st.column_config.BooleanColumn("Distribution Risk"),
+            "Entry_Signal": st.column_config.BooleanColumn("Entry Signal"),
+        }
+        st.dataframe(
+            filtered_df[available_columns],
+            use_container_width=True,
+            hide_index=True,
+            column_config=column_config,
+            selection_mode="single-row",
+            on_select=handle_table_select,
+            key="combined_table",
+        )
+        csv_data = filtered_df[available_columns].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Tabelle als CSV",
+            data=csv_data,
+            file_name="smartmoney_dashboard_tabelle.csv",
+            mime="text/csv",
+            key="combined_table_download",
+        )
+        st.caption("💡 Doppelklick auf eine Zeile aktiviert den Coin für das Diagramm.")
 else:
-    st.info("Noch keine Top-100 Daten im Cache. Klicke auf „Top-100 aktualisieren“ (Cooldown beachten).")
+    st.info("Noch keine Daten verfügbar. Starte einen Scan oder lade die Top-100.")
 
 # ================= Auto-Scan Scheduler (Top-100 + Telegram) =================
 auto_info_ph = st.empty()
@@ -821,3 +939,6 @@ if active:
             high_since_entry = t2.number_input("Höchster Kurs seit Entry", min_value=0.0, value=last_px, step=0.001, format="%.6f", key=f"trail_high_{active}")
             tstop = trailing_stop(high_since_entry, trail_pct)
             st.write(f"Trailing Stop bei **${tstop:,.3f}** (High {high_since_entry:,.3f}, Trail {trail_pct:.1f}%)")
+
+if st.session_state.get("AUTH_OK", False):
+    persist_settings(SETTINGS_DB_KEYS)
