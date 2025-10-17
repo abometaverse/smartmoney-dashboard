@@ -1,13 +1,17 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v3.5  (Telegram Alerts + Auto-Scan Scheduler; Single-Select strikt;
-#        CG-ID→Binance Mapping fix; flüchtige Scan-Infos; Top100 Cache/Cooldown)
+# v3.6  Fixes:
+#  - Einziger Top-100-Block (keine Duplikate)
+#  - Chart stabil (aktive Coin-Auswahl, Historie-Load)
+#  - Persistenz nach Logout/Login (Top100 + Settings + aktiver Coin)
+#  - Striktes Single-Select in Tabellen mit sofortigem st.rerun()
+#  - Cooldown/Last Sync korrekt angezeigt & beibehalten
 #
 # Secrets (Streamlit → Advanced settings → Secrets):
 # APP_PASSWORD = "DeinStarkesPasswort"
-# TELEGRAM_BOT_TOKEN = "123:abc"   # optional (für Alerts)
-# TELEGRAM_CHAT_ID   = "123456789" # optional (für Alerts)
+# TELEGRAM_BOT_TOKEN = "123:abc"   # optional (Alerts)
+# TELEGRAM_CHAT_ID   = "123456789" # optional (Alerts)
 # APP_URL            = "https://deine-app-url.streamlit.app"  # optional
 # -------------------------------------------------------------
 
@@ -26,6 +30,13 @@ import streamlit as st
 st.set_page_config(page_title="Smart Money Dashboard — Geschützt", layout="wide")
 
 # ================= Session Helpers =================
+PERSIST_KEYS = [
+    "selected_ids","vol_surge_thresh","lookback_res","alerts_enabled",
+    "days_hist","batch_size_slider","scan_index","selected_coin",
+    "top100_df","top100_last_sync_ts","top100_cooldown_min",
+    "auto_scan_enabled","auto_scan_hours","auto_last_ts","auto_alerted_ids"
+]
+
 def save_state(keys):
     for k in keys:
         if k in st.session_state:
@@ -37,8 +48,33 @@ def restore_state(keys):
         if saved_key in st.session_state:
             st.session_state[k] = st.session_state[saved_key]
 
+def ensure_defaults():
+    # Nur setzen, wenn nicht vorhanden – verhindert Überschreiben nach restore_state()
+    defaults = {
+        "selected_ids": [],
+        "vol_surge_thresh": 1.5,
+        "lookback_res": 20,
+        "alerts_enabled": True,
+        "days_hist": 90,
+        "batch_size_slider": 3,
+        "scan_index": 0,
+        "selected_coin": None,
+        "top100_df": pd.DataFrame(),
+        "top100_last_sync_ts": 0.0,
+        "top100_cooldown_min": 15,
+        "auto_scan_enabled": False,
+        "auto_scan_hours": 1.0,
+        "auto_last_ts": 0.0,
+        "auto_alerted_ids": [],
+        "signals_cache": pd.DataFrame(),
+        "history_cache": {},
+        "last_selection_source": ""
+    }
+    for k,v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
 def set_active_coin(coin_id: str, source: str):
-    """Setzt den global aktiven Coin und merkt, woher die Auswahl kam."""
     st.session_state["selected_coin"] = str(coin_id)
     st.session_state["last_selection_source"] = source
 
@@ -55,12 +91,7 @@ def auth_gate() -> None:
         c1, c2 = top.columns([6,1])
         c1.success("Zugriff gewährt.")
         if c2.button("Logout"):
-            save_state([
-                "selected_ids","vol_surge_thresh","lookback_res","alerts_enabled",
-                "days_hist","batch_size_slider","scan_index","selected_coin",
-                "top100_df","top100_last_sync_ts","top100_cooldown_min",
-                "auto_scan_enabled","auto_scan_hours","auto_last_ts","auto_alerted_ids"
-            ])
+            save_state(PERSIST_KEYS)
             st.session_state["AUTH_OK"] = False
             st.success("Einstellungen gespeichert.")
             time.sleep(0.2)
@@ -73,18 +104,16 @@ def auth_gate() -> None:
         if ok:
             if pw == secret_pw:
                 st.session_state["AUTH_OK"] = True
-                restore_state([
-                    "selected_ids","vol_surge_thresh","lookback_res","alerts_enabled",
-                    "days_hist","batch_size_slider","scan_index","selected_coin",
-                    "top100_df","top100_last_sync_ts","top100_cooldown_min",
-                    "auto_scan_enabled","auto_scan_hours","auto_last_ts","auto_alerted_ids"
-                ])
+                # Wichtig: Defaults ERST NACH restore_state() setzen
+                restore_state(PERSIST_KEYS)
+                ensure_defaults()
                 st.rerun()
             else:
                 st.error("Falsches Passwort.")
     st.stop()
 
 auth_gate()
+ensure_defaults()  # beim ersten Run nach Login (ohne Überschreiben der Restores)
 
 # ================= Constants & HTTP =================
 FIAT = "usd"
@@ -98,7 +127,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/3.5 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/3.6 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -308,14 +337,13 @@ def send_telegram(msg: str) -> bool:
         return False
 
 def telegram_alert_for_entries(df: pd.DataFrame) -> List[str]:
-    """sendet Alerts für neue Entry-Signale (Top-100) und gibt die IDs zurück, die gemeldet wurden"""
     if df.empty: return []
     app_url = st.secrets.get("APP_URL", "")
     alerted = []
     sent_before: set = set(st.session_state.get("auto_alerted_ids", []))
     for _, r in df[df["Entry_Signal"] & (df["status"]=="ok")].iterrows():
         cid = str(r["id"])
-        if cid in sent_before:  # nicht spammen
+        if cid in sent_before:
             continue
         name = str(r.get("name", cid))
         sym  = str(r.get("symbol", "")) or cid
@@ -325,7 +353,6 @@ def telegram_alert_for_entries(df: pd.DataFrame) -> List[str]:
         if ok:
             alerted.append(cid)
             sent_before.add(cid)
-            # aktiven Coin setzen
             st.session_state["selected_coin"] = cid
     st.session_state["auto_alerted_ids"] = list(sent_before)
     return alerted
@@ -333,41 +360,22 @@ def telegram_alert_for_entries(df: pd.DataFrame) -> List[str]:
 # ================= Sidebar =================
 st.sidebar.header("Settings")
 
-for k, v in {
-    "selected_ids": [],
-    "vol_surge_thresh": 1.5,
-    "lookback_res": 20,
-    "alerts_enabled": True,
-    "days_hist": 90,
-    "batch_size_slider": 3,
-    "scan_index": 0,
-    "selected_coin": None,
-    "top100_df": pd.DataFrame(),
-    "top100_last_sync_ts": 0.0,
-    "top100_cooldown_min": 15,
-    "auto_scan_enabled": False,
-    "auto_scan_hours": 1.0,
-    "auto_last_ts": 0.0,
-    "auto_alerted_ids": []
-}.items():
-    st.session_state.setdefault(k, v)
-
+# Slider mit Keys (persistieren automatisch)
 days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15, key="days_hist")
 vol_surge_thresh = st.sidebar.slider("Vol Surge vs 7d (x)", 1.0, 5.0, float(st.session_state["vol_surge_thresh"]), 0.1, key="vol_surge")
 lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 60, int(st.session_state["lookback_res"]), 1, key="lookback")
 
-# Top-100 Refresh-Cooldown in Minuten (manuell)
+# Refresh-Cooldown & Auto-Scan
 st.session_state["top100_cooldown_min"] = st.sidebar.number_input(
     "Top-100 Refresh-Sperre (Minuten)", min_value=1, max_value=120,
-    value=int(st.session_state["top100_cooldown_min"]), step=1
+    value=int(st.session_state["top100_cooldown_min"]), step=1, key="cooldown_min"
 )
 
-# Auto-Scan (Stunden) + Toggle
 c_as1, c_as2 = st.sidebar.columns([1,1])
-st.session_state["auto_scan_enabled"] = c_as1.checkbox("Auto-Scan & Telegram", value=bool(st.session_state["auto_scan_enabled"]))
-st.session_state["auto_scan_hours"]   = c_as2.number_input("Intervall (Std.)", min_value=0.5, max_value=24.0, step=0.5, value=float(st.session_state["auto_scan_hours"]))
+st.session_state["auto_scan_enabled"] = c_as1.checkbox("Auto-Scan & Telegram", value=bool(st.session_state["auto_scan_enabled"]), key="auto_enabled")
+st.session_state["auto_scan_hours"]   = c_as2.number_input("Intervall (Std.)", min_value=0.5, max_value=24.0, step=0.5, value=float(st.session_state["auto_scan_hours"]), key="auto_hours")
 
-# Watchlist (nur CG für Suche/Komfort; optional)
+# Watchlist (CG nur für Suche/Komfort)
 top_df = cg_top_coins(limit=500)
 if top_df.empty:
     st.sidebar.warning("Top-Liste (CG) aktuell nicht verfügbar. Fallback-Auswahl.")
@@ -397,7 +405,7 @@ if manual.strip(): selected_ids.append(manual.strip())
 if not selected_ids: selected_ids = ["bitcoin","ethereum"]
 st.session_state["selected_ids"] = selected_ids
 
-# Scan-Steuerung (flüchtige Placeholders)
+# Scan-Steuerung
 c_scan1, c_scan2 = st.sidebar.columns(2)
 scan_now_batch = c_scan1.button("🔔 Batch scannen", key="scan_btn_batch")
 scan_now_full  = c_scan2.button("🔁 Ganze Watchlist", key="scan_btn_full")
@@ -405,16 +413,14 @@ batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 15, int(st.se
 if st.sidebar.button("🔄 Batch zurücksetzen", key="reset_batch_btn"):
     st.session_state["scan_index"] = 0
 
-st.caption("🔒 Passwortschutz aktiv • Scans: Batch oder komplette Watchlist • Tabellen: Filter pro Spalte (Editor-Toolbar).")
+st.caption("🔒 Passwortschutz aktiv • Scans: Batch oder komplette Watchlist • Tabellen: Filter per Editor-Toolbar.")
 
 # ================= Utility: Name/Symbol =================
 def _name_and_symbol_any(coin_id_or_symbol: str) -> Tuple[str,str]:
-    # Versuche Binance-Base aus Symbol/ID zu extrahieren
     sym = resolve_to_binance_symbol(coin_id_or_symbol)
     base_guess = None
     if sym and sym.upper().endswith("USDT"):
         base_guess = sym[:-4].upper()
-    # Fallback CG-Namen
     try:
         if isinstance(top_df, pd.DataFrame) and not top_df.empty and coin_id_or_symbol in set(top_df["id"]):
             row = top_df[top_df["id"]==coin_id_or_symbol].iloc[0]
@@ -428,23 +434,19 @@ def _name_and_symbol_any(coin_id_or_symbol: str) -> Tuple[str,str]:
     return s, s
 
 # ================= Signals & Levels — Watchlist =================
-if "signals_cache" not in st.session_state: st.session_state["signals_cache"] = pd.DataFrame()
-if "history_cache" not in st.session_state: st.session_state["history_cache"] = {}
-
 def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, lookback: int,
                          progress_label: str = "Scanne …") -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     rows, history_cache = [], {}
     total = len(id_list)
     if total == 0:
         return pd.DataFrame(), {}
-    prog  = st.progress(0, text=progress_label)   # flüchtig
-    note  = st.empty()                             # flüchtig
+    prog  = st.progress(0, text=progress_label)
+    note  = st.empty()
     PAUSE_BETWEEN = 0.45
 
     for i, cid in enumerate(id_list, start=1):
         note.info(f"{progress_label}: {i}/{total} — {cid}")
         time.sleep(PAUSE_BETWEEN)
-
         hist = load_history(cid, days=days_hist)
         status_val = hist.attrs.get("status", "") if isinstance(hist, pd.DataFrame) else "no_df"
         name, symbol = _name_and_symbol_any(cid)
@@ -510,45 +512,46 @@ def run_scan_batch():
         return pd.DataFrame(), {}
     info_ph = st.empty()
     info_ph.info(f"⏳ Batch {start+1}–{end} von {len(ids)} …")
-    df, cache = compute_rows_for_ids(batch, days_hist, vol_surge_thresh, lookback_res, "Batch-Scan")
+    df, cache = compute_rows_for_ids(batch, st.session_state["days_hist"], st.session_state["vol_surge_thresh"], st.session_state["lookback_res"], "Batch-Scan")
     st.session_state["scan_index"] = end % max(1, len(ids))
-    info_ph.empty()  # verschwinden lassen
+    info_ph.empty()
     return df, cache
 
 def run_scan_full_watchlist():
     ids = list(st.session_state.get("selected_ids", []))
     info_ph = st.empty()
     info_ph.info("🔁 Scanne gesamte Watchlist …")
-    df, cache = compute_rows_for_ids(ids, days_hist, vol_surge_thresh, lookback_res, "Watchlist-Scan")
+    df, cache = compute_rows_for_ids(ids, st.session_state["days_hist"], st.session_state["vol_surge_thresh"], st.session_state["lookback_res"], "Watchlist-Scan")
     info_ph.empty()
     return df, cache
 
-if st.session_state.get("signals_cache","") is None:
-    st.session_state["signals_cache"] = pd.DataFrame()
-if st.session_state.get("history_cache","") is None:
-    st.session_state["history_cache"] = {}
+# Initial caches (nicht überschreiben, wenn vorhanden)
+signals_df = st.session_state.get("signals_cache", pd.DataFrame())
+history_cache = st.session_state.get("history_cache", {})
 
 # Aktionen
-if st.sidebar.button("Jetzt aktualisieren (alle)"):
+if st.sidebar.button("Jetzt aktualisieren (alle)", key="refresh_all_btn"):
     sig, hist_cache = run_scan_full_watchlist()
     if not sig.empty:
         st.session_state["signals_cache"] = sig
+        signals_df = sig
     st.session_state["history_cache"].update(hist_cache)
 
 if scan_now_batch:
     sig, hist_cache = run_scan_batch()
     if not sig.empty:
         st.session_state["signals_cache"] = sig
+        signals_df = sig
     st.session_state["history_cache"].update(hist_cache)
 
 if scan_now_full:
     sig, hist_cache = run_scan_full_watchlist()
     if not sig.empty:
         st.session_state["signals_cache"] = sig
+        signals_df = sig
     st.session_state["history_cache"].update(hist_cache)
 
-signals_df = st.session_state.get("signals_cache", pd.DataFrame()).copy()
-
+# ---- Watchlist Tabelle
 st.subheader("🔎 Signals & Levels — Watchlist")
 if not signals_df.empty:
     for c in ["price","MA20","MA50","Resistance","Support","Vol_Surge_x"]:
@@ -561,11 +564,11 @@ if not signals_df.empty:
     view_df["Resistance"] = view_df["Resistance"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
     view_df["Support"]    = view_df["Support"].map(lambda x: fmt_money(x, 4) if pd.notna(x) else "")
     view_df["Vol_Surge_x"]= view_df["Vol_Surge_x"].map(lambda x: f"{x:.2f}x" if pd.notna(x) else "")
-    # Single-Select via CheckboxColumn
+
     if "▶" not in view_df.columns:
         view_df.insert(0, "▶", False)
-
     active_coin = str(st.session_state.get("selected_coin", ""))
+    # genau ein TRUE vorinitialisieren
     view_df["▶"] = (signals_df["id"].astype(str) == active_coin).reindex(view_df.index, fill_value=False)
 
     edited = st.data_editor(
@@ -575,8 +578,6 @@ if not signals_df.empty:
         column_config={"▶": st.column_config.CheckboxColumn(help="Ein Klick aktiviert den Coin (nur einer gleichzeitig).")},
         num_rows="fixed"
     )
-
-    # Enforce Single-Select (nimm erste TRUE) + sofort neu rendern
     try:
         chosen_idx: Optional[int] = None
         if isinstance(edited, pd.DataFrame) and "▶" in edited.columns:
@@ -585,25 +586,26 @@ if not signals_df.empty:
                 chosen_idx = t.index[0]
         if chosen_idx is not None and chosen_idx in signals_df.index:
             set_active_coin(signals_df.loc[chosen_idx, "id"], source="watchlist")
-            st.rerun()  # << sofort neu zeichnen, alle anderen deaktiviert
+            st.rerun()
     except Exception:
         pass
 
-# ================= Top-100 — Binance =================
+# ================= Top-100 — EIN Block =================
 st.markdown("---")
 st.subheader("📈 Detail & Risk — Top-100 (Binance)")
-
-# Persistente Top-100-Strukturen
-st.session_state.setdefault("top100_df", pd.DataFrame())
-st.session_state.setdefault("top100_last_sync_ts", 0.0)
+if "top100_df" not in st.session_state:
+    st.session_state["top100_df"] = pd.DataFrame()
+if "top100_last_sync_ts" not in st.session_state:
+    st.session_state["top100_last_sync_ts"] = 0.0
 
 c1, c2 = st.columns([1.5,1.2])
 with c1:
-    refresh_btn = st.button("🔄 Top-100 aktualisieren")
+    refresh_btn = st.button("🔄 Top-100 aktualisieren", key="top100_refresh")
 with c2:
-    st.write(f"Letzte Sync: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.session_state['top100_last_sync_ts'])) if st.session_state['top100_last_sync_ts'] else '—'}")
+    last_sync_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.session_state["top100_last_sync_ts"])) if st.session_state["top100_last_sync_ts"] else "—"
+    st.write(f"Letzte Sync: {last_sync_str}")
 
-top_filter = st.radio("Filter", ["Alle (Top-100)", "Nur Entry-Signal (Top-100)", "Nur Watchlist"], index=0, horizontal=True)
+top_filter = st.radio("Filter", ["Alle (Top-100)", "Nur Entry-Signal (Top-100)", "Nur Watchlist"], index=0, horizontal=True, key="top100_filter")
 
 def load_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> pd.DataFrame:
     top = binance_top100_by_quote_volume()
@@ -630,7 +632,6 @@ def load_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> p
     st.session_state["history_cache"].update(cache)
     return df100.sort_values("rank", kind="stable").reset_index(drop=True)
 
-# Start: nur vorhandene Daten nutzen. Refresh nur bei Klick + Cooldown ok.
 now = time.time()
 cooldown = int(st.session_state["top100_cooldown_min"]) * 60
 should_refresh = refresh_btn and (now - st.session_state["top100_last_sync_ts"] >= cooldown)
@@ -652,7 +653,6 @@ if not top100_df.empty:
         top100_view = top100_df[(top100_df["Entry_Signal"] == True) & (top100_df["status"] == "ok")].copy()
     elif top_filter == "Nur Watchlist":
         wl_raw = set(st.session_state.get("selected_ids", []))
-        # map watchlist items to Binance symbols for filtering
         wl_mapped = set(filter(None, [resolve_to_binance_symbol(x) for x in wl_raw]))
         top100_view = top100_df[top100_df["id"].isin(wl_mapped)].copy()
     else:
@@ -665,44 +665,34 @@ if not top100_df.empty:
     if "▶" not in top100_view.columns:
         top100_view.insert(0, "▶", False)
     prev = st.session_state.get("selected_coin")
-    if prev in set(top100_view["id"].astype(str)):
-        try:
-            top100_view.loc[top100_view["id"].astype(str)==str(prev), "▶"] = True
-        except Exception:
-            pass
-
-    top100_view = top100_view.sort_values("rank", kind="stable").reset_index(drop=True)
+    top100_view["▶"] = (top100_view["id"].astype(str) == str(prev))
 
     edited_top = st.data_editor(
         top100_view[["▶","rank","name","symbol","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]],
         use_container_width=True,
         hide_index=True,
         column_config={"▶": st.column_config.CheckboxColumn(help="Ein Klick aktiviert den Coin (nur einer gleichzeitig).")},
-        num_rows="fixed"
+        num_rows="fixed",
+        key="top100_editor"
     )
 
-    # Single-Select erzwingen (erste TRUE) + sofort neu rendern
     try:
         chosen_idx = None
         if isinstance(edited_top, pd.DataFrame) and "▶" in edited_top.columns:
             t = edited_top[edited_top["▶"] == True]
             if not t.empty:
                 chosen_idx = t.index[0]
-        if chosen_idx is not None and chosen_idx in top100_view.index:
-            chosen_rank = int(top100_view.loc[chosen_idx, "rank"])
-            row = top100_df[top100_df["rank"] == chosen_rank]
-            if not row.empty and "id" in row.columns:
-                set_active_coin(row.iloc[0]["id"], source="top100")
-                st.rerun()  # 🔁 sofort neu zeichnen
+        if chosen_idx is not None and chosen_idx in edited_top.index:
+            # Hier aus edited_top die ID abgreifen
+            chosen_id = str(edited_top.loc[chosen_idx, "id"])
+            set_active_coin(chosen_id, source="top100")
+            st.rerun()
     except Exception:
         pass
-
 else:
     st.info("Noch keine Top-100 Daten im Cache. Klicke auf „Top-100 aktualisieren“ (Cooldown beachten).")
 
 # ================= Auto-Scan Scheduler (Top-100 + Telegram) =================
-# Hinweis: Streamlit hat keine echten Hintergrundjobs. Wir triggern am Anfang eines Runs,
-# wenn genug Zeit vergangen ist, automatisch einen Top-100-Scan und senden ggf. Alerts.
 auto_info_ph = st.empty()
 if st.session_state["auto_scan_enabled"]:
     last = float(st.session_state.get("auto_last_ts", 0.0) or 0.0)
@@ -713,7 +703,6 @@ if st.session_state["auto_scan_enabled"]:
         if not df100_new.empty:
             st.session_state["top100_df"] = df100_new
             st.session_state["top100_last_sync_ts"] = time.time()
-            # Telegram Alerts
             if st.session_state.get("alerts_enabled", True):
                 alerted_ids = telegram_alert_for_entries(df100_new)
                 if alerted_ids:
@@ -725,7 +714,7 @@ if st.session_state["auto_scan_enabled"]:
 st.markdown("---")
 active = st.session_state.get("selected_coin")
 
-# Falls keiner aktiv, nimm ersten Entry aus Top-100, sonst ersten aus Watchlist-Mapping
+# Falls keiner aktiv, versuche Entry aus Top100, sonst ersten Watchlist-Treffer (gemappt)
 if not active:
     if not top100_df.empty:
         df_e = top100_df[(top100_df["Entry_Signal"]==True) & (top100_df["status"]=="ok")]
@@ -733,7 +722,6 @@ if not active:
             active = str(df_e.iloc[0]["id"])
             st.session_state["selected_coin"] = active
     if not active and st.session_state.get("selected_ids"):
-        # nimm den ersten Watchlist-Eintrag, gemappt
         for x in st.session_state["selected_ids"]:
             m = resolve_to_binance_symbol(x)
             if m:
@@ -773,14 +761,13 @@ if active:
         if d_daily.empty:
             st.warning("Keine Tagesdaten.")
         else:
-            r, s  = calc_local_levels(d_daily, lookback_res)
+            r, s  = calc_local_levels(d_daily, st.session_state["lookback_res"])
             d_daily["ma20"] = ma(d_daily["price"], 20)
             d_daily["ma50"] = ma(d_daily["price"], 50)
             d_daily["vol7"] = d_daily["volume"].rolling(7, min_periods=3).mean()
             d_daily["vol_ratio"] = d_daily["volume"] / d_daily["vol7"]
-            d_daily["roll_max_prev"] = d_daily["price"].shift(1).rolling(lookback_res, min_periods=5).max()
+            d_daily["roll_max_prev"] = d_daily["price"].shift(1).rolling(st.session_state["lookback_res"], min_periods=5).max()
 
-            # KORREKT: bool-Maske (kein String)
             entry_mask = (
                 (d_daily["price"] > d_daily["ma20"]) &
                 (d_daily["ma20"] > d_daily["ma50"]) &
