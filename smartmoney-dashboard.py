@@ -776,10 +776,15 @@ if active:
             d_daily["vol7"] = d_daily["volume"].rolling(7, min_periods=3).mean()
             d_daily["vol_ratio"] = d_daily["volume"] / d_daily["vol7"]
             d_daily["roll_max_prev"] = d_daily["price"].shift(1).rolling(lookback_res, min_periods=5).max()
-            d_daily["entry_flag"] = (d_daily["price"] > d_daily["ma20"]) & (d_daily["ma20"] > d_daily["ma50"]) & \
-                                    (d_daily["price"] > d_daily["roll_max_prev"]) & \
-                                    (d_daily["vol_ratio"] >= st.session_state["vol_surge_thresh"])
-            entries = d_daily[daily := "entry_flag"]
+            entry_mask = (
+                (d_daily["price"] > d_daily["ma20"]) &
+                (d_daily["ma20"] > d_daily["ma50"]) &
+                (d_daily["price"] > d_daily["roll_max_prev"]) &
+                (d_daily["vol_ratio"] >= st.session_state["vol_surge_thresh"])
+            )
+            d_daily["entry_flag"] = entry_mask
+
+            entries = d_daily[entry_mask]  # jetzt ein DataFrame, nicht mehr eine Serie
 
             fig, ax_price = plt.subplots()
             ax_vol = ax_price.twinx()
