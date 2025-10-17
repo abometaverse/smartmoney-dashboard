@@ -37,6 +37,11 @@ def restore_state(keys):
         if saved_key in st.session_state:
             st.session_state[k] = st.session_state[saved_key]
 
+def set_active_coin(coin_id: str, source: str):
+    """Setzt den global aktiven Coin und merkt, woher die Auswahl kam."""
+    st.session_state["selected_coin"] = str(coin_id)
+    st.session_state["last_selection_source"] = source
+
 # ================= Auth Gate =================
 def auth_gate() -> None:
     st.title("🧠 Smart Money Dashboard — Geschützt")
@@ -680,7 +685,7 @@ if not top100_df.empty:
         num_rows="fixed"
     )
 
-    # Single-Select erzwingen (erste TRUE)
+    # Single-Select erzwingen (erste TRUE) + sofort neu rendern
     try:
         chosen_idx = None
         if isinstance(edited_top, pd.DataFrame) and "▶" in edited_top.columns:
@@ -691,9 +696,11 @@ if not top100_df.empty:
             chosen_rank = int(top100_view.loc[chosen_idx, "rank"])
             row = top100_df[top100_df["rank"] == chosen_rank]
             if not row.empty and "id" in row.columns:
-                st.session_state["selected_coin"] = str(row.iloc[0]["id"])
+                set_active_coin(row.iloc[0]["id"], source="top100")
+                st.rerun()  # 🔁 sofort neu zeichnen
     except Exception:
         pass
+
 else:
     st.info("Noch keine Top-100 Daten im Cache. Klicke auf „Top-100 aktualisieren“ (Cooldown beachten).")
 
@@ -727,8 +734,8 @@ if not active:
     if not top100_df.empty:
         df_e = top100_df[(top100_df["Entry_Signal"]==True) & (top100_df["status"]=="ok")]
         if not df_e.empty:
-            active = str(df_e.iloc[0]["id"])
-            st.session_state["selected_coin"] = active
+            active = str(st.session_state.get("selected_coin", ""))
+            top100_view["▶"] = (top100_view["id"].astype(str) == active)
     if not active and st.session_state.get("selected_ids"):
         # nimm den ersten Watchlist-Eintrag, gemappt
         for x in st.session_state["selected_ids"]:
