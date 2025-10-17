@@ -565,13 +565,8 @@ if not signals_df.empty:
     if "▶" not in view_df.columns:
         view_df.insert(0, "▶", False)
 
-    sel = st.session_state.get("selected_coin")
-    if sel in set(signals_df["id"].astype(str)):
-        try:
-            idx_first = signals_df.index[signals_df["id"].astype(str)==str(sel)][0]
-            view_df.loc[idx_first, "▶"] = True
-        except Exception:
-            pass
+    active_coin = str(st.session_state.get("selected_coin", ""))
+    view_df["▶"] = (signals_df["id"].astype(str) == active_coin).reindex(view_df.index, fill_value=False)
 
     edited = st.data_editor(
         view_df[["▶","rank","name","symbol","price","MA20","MA50","Vol_Surge_x","Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"]],
@@ -581,7 +576,7 @@ if not signals_df.empty:
         num_rows="fixed"
     )
 
-    # Enforce Single-Select (nimm erste TRUE)
+    # Enforce Single-Select (nimm erste TRUE) + sofort neu rendern
     try:
         chosen_idx: Optional[int] = None
         if isinstance(edited, pd.DataFrame) and "▶" in edited.columns:
@@ -589,7 +584,8 @@ if not signals_df.empty:
             if not t.empty:
                 chosen_idx = t.index[0]
         if chosen_idx is not None and chosen_idx in signals_df.index:
-            st.session_state["selected_coin"] = str(signals_df.loc[chosen_idx, "id"])
+            set_active_coin(signals_df.loc[chosen_idx, "id"], source="watchlist")
+            st.rerun()  # << sofort neu zeichnen, alle anderen deaktiviert
     except Exception:
         pass
 
@@ -734,8 +730,8 @@ if not active:
     if not top100_df.empty:
         df_e = top100_df[(top100_df["Entry_Signal"]==True) & (top100_df["status"]=="ok")]
         if not df_e.empty:
-            active = str(st.session_state.get("selected_coin", ""))
-            top100_view["▶"] = (top100_view["id"].astype(str) == active)
+            active = str(df_e.iloc[0]["id"])
+            st.session_state["selected_coin"] = active
     if not active and st.session_state.get("selected_ids"):
         # nimm den ersten Watchlist-Eintrag, gemappt
         for x in st.session_state["selected_ids"]:
@@ -783,6 +779,8 @@ if active:
             d_daily["vol7"] = d_daily["volume"].rolling(7, min_periods=3).mean()
             d_daily["vol_ratio"] = d_daily["volume"] / d_daily["vol7"]
             d_daily["roll_max_prev"] = d_daily["price"].shift(1).rolling(lookback_res, min_periods=5).max()
+
+            # KORREKT: bool-Maske (kein String)
             entry_mask = (
                 (d_daily["price"] > d_daily["ma20"]) &
                 (d_daily["ma20"] > d_daily["ma50"]) &
@@ -790,8 +788,7 @@ if active:
                 (d_daily["vol_ratio"] >= st.session_state["vol_surge_thresh"])
             )
             d_daily["entry_flag"] = entry_mask
-
-            entries = d_daily[entry_mask]  # jetzt ein DataFrame, nicht mehr eine Serie
+            entries = d_daily[entry_mask].dropna(subset=["price"])
 
             fig, ax_price = plt.subplots()
             ax_vol = ax_price.twinx()
@@ -802,7 +799,7 @@ if active:
             if not np.isnan(r): ax_price.axhline(r, linestyle="--", label=f"Resistance {r:.3f}")
             if not np.isnan(s): ax_price.axhline(s, linestyle="--", label=f"Support {s:.3f}")
             if not entries.empty:
-                ax_price.scatter(entries.index, entries["price"], s=36, zorder=5, color="#16a34a", label="Entry (hist)")
+                ax_price.scatter(entries.index, entries["price"].astype(float), s=36, zorder=5, color="#16a34a", label="Entry (hist)")
             ax_vol.bar(d_daily.index, d_daily["volume"], alpha=0.28)
             ax_vol.set_ylabel("Volume")
 
