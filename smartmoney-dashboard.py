@@ -1,15 +1,16 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v5.2 (AGGrid Styling + 2 Dezimalstellen)
+# v5.3 (Fix DuplicateElementKey + stabiles Watchlist-Add)
 #  - Eine einzige Tabelle (Watchlist + Top-100) mit st-aggrid
 #  - Doppelklick -> genau 1 aktiver Coin (selected_coin), initial None
-#  - Filter: Top-100 / Watchlist / Entry-Signale (kein "Alle")
+#  - Filter: Top-100 / Watchlist / Entry-Signale
 #  - "Ursprung" (Universe) & "Ticker" sind ausgeblendet
-#  - Neue Spalte "Daten" (Bi / Cg) zeigt Datenursprung an
+#  - Spalte "Daten" (Bi / Cg) zeigt Datenursprung
 #  - Telegram-Alerts (manuell + Auto-Scan), Cooldown & Last-Sync
 #  - Tausenderformat, Permalink via st.query_params
-#  - NEU: Zellfarben (Vol x7d / Breakout / Entry), max. 2 Dezimalstellen
+#  - Zellfarben (Vol x7d / Breakout / Entry), max. 2 Dezimalstellen
+#  - FIX: keine doppelten Buttons/Keys; Watchlist-Add mehrfach stabil
 # -------------------------------------------------------------
 
 import math
@@ -66,6 +67,7 @@ def ensure_defaults():
         "auto_alerted_ids": [],
         "signals_cache": pd.DataFrame(),
         "history_cache": {},
+        "pending_add_to_watchlist": []
     }
     for k,v in defaults.items():
         if k not in st.session_state:
@@ -122,7 +124,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/5.2 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/5.3 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -152,7 +154,7 @@ def fmt_money(n: float, decimals: int = 2) -> str:
 def ma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=max(2, window//2)).mean()
 
-# ---------- Binance helpers (multi-endpoint) ----------
+# ---------- Binance helpers ----------
 def _binance_first_ok(path: str, params: Dict=None, timeout: int=10):
     sess = get_http()
     last_err = None
@@ -207,7 +209,7 @@ def binance_top100_by_quote_volume() -> pd.DataFrame:
     df["rank"] = df.index + 1
     df["name"] = df["baseAsset"].str.upper()
     df["symbol_txt"] = df["baseAsset"].str.upper()
-    df["id"] = df["symbol"]  # ID = Binance-Symbol (stabil für Historie)
+    df["id"] = df["symbol"]
     return df[["rank","id","symbol","name","symbol_txt","quoteVolume"]].rename(columns={"symbol_txt":"symbol2"})
 
 # ---------- CoinGecko nur für Watchlist-Suche ----------
@@ -228,7 +230,6 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
 # ---------- CG-ID → Binance-Symbol Mapping ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_to_binance_symbol(coin_id_or_symbol: str) -> Optional[str]:
-    """Akzeptiert CG-ID ('render-token'), BaseAsset ('RNDR') oder BINANCE-Symbol ('RNDRUSDT')"""
     if not coin_id_or_symbol: return None
     s = str(coin_id_or_symbol).strip()
     if s.upper().endswith("USDT"):
@@ -363,7 +364,7 @@ c_as1, c_as2 = st.sidebar.columns([1,1])
 st.session_state["auto_scan_enabled"] = c_as1.checkbox("Auto-Scan & Telegram", value=bool(st.session_state["auto_scan_enabled"]), key="auto_enabled")
 st.session_state["auto_scan_hours"]   = c_as2.number_input("Intervall (Std.)", min_value=0.5, max_value=24.0, step=0.5, value=float(st.session_state["auto_scan_hours"]), key="auto_hours")
 
-# Watchlist (CG nur für Suche/Komfort)
+# Watchlist-Suche (CG)
 top_df_search = cg_top_coins(limit=500)
 if top_df_search.empty:
     st.sidebar.warning("Top-Liste (CG) aktuell nicht verfügbar. Fallback-Auswahl.")
@@ -391,17 +392,14 @@ else:
 manual = st.sidebar.text_input("Zusätzliche ID (optional: CG-ID oder BASE/BASEUSDT)", value="", key="manual_id")
 if manual.strip(): selected_ids.append(manual.strip())
 if not selected_ids: selected_ids = ["bitcoin","ethereum"]
-# ---- Merge statt Überschreiben: Sidebar-Selection ∪ bereits vorhandene (z.B. aus AG-Grid hinzugefügt)
 existing = list(st.session_state.get("selected_ids", []))
 merged = existing + [x for x in selected_ids if x not in existing]
 st.session_state["selected_ids"] = merged
-
 
 # Scan-Steuerung
 c_scan1, c_scan2 = st.sidebar.columns(2)
 scan_now_full  = c_scan1.button("🔁 Ganze Watchlist", key="scan_btn_full")
 refresh_top100 = c_scan2.button("🔄 Top-100 aktualisieren", key="top100_refresh")
-
 batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 15, int(st.session_state["batch_size_slider"]), 1, key="batch_size_slider")
 scan_now_batch = st.sidebar.button("🔔 Batch scannen", key="scan_btn_batch")
 if st.sidebar.button("🔄 Batch zurücksetzen", key="reset_batch_btn"):
@@ -513,7 +511,7 @@ def run_scan_batch():
     st.session_state["scan_index"] = end % max(1, len(ids))
     return df, cache
 
-# Aktionen (Scans)
+# Aktionen
 if scan_now_full:
     sig, hist_cache = run_scan_full_watchlist()
     if not sig.empty:
@@ -526,7 +524,7 @@ if scan_now_batch:
         st.session_state["signals_cache"] = sig
     st.session_state["history_cache"].update(hist_cache)
 
-# Top-100 Builder & Refresh
+# Top-100 Build & Refresh
 def build_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> pd.DataFrame:
     base = binance_top100_by_quote_volume()
     if base.empty:
@@ -592,28 +590,24 @@ if ts:
 watch_df = st.session_state.get("signals_cache", pd.DataFrame()).copy()
 top_df   = st.session_state.get("top100_df", pd.DataFrame()).copy()
 
-# Universe kennzeichnen
 if not watch_df.empty:
     watch_df["universe"] = "Watchlist"
 if not top_df.empty:
     top_df["universe"] = "Top100"
 
-# Union – Watchlist überschreibt Top-100 bei gleicher id
 union = pd.concat([watch_df.assign(_prio=0), top_df.assign(_prio=1)], ignore_index=True)
 if not union.empty:
     union.sort_values(by=["id","_prio"], inplace=True)
     union = union.drop_duplicates(subset=["id"], keep="first").drop(columns=["_prio"])
 
-# --------- Filter (nur 3 Optionen, kein "Alle") ----------
 flt = st.radio("Filter", ["Top-100", "Watchlist", "Entry-Signale"], horizontal=True)
 if flt == "Top-100":
     union = union[union["universe"]=="Top100"]
 elif flt == "Watchlist":
     union = union[union["universe"]=="Watchlist"]
-else:  # Entry-Signale
+else:
     union = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
 
-# Query-Param → aktiver Coin (nur wenn noch keiner gesetzt)
 if st.session_state.get("selected_coin") is None:
     qp = st.query_params.get("coin")
     if qp:
@@ -622,10 +616,8 @@ if st.session_state.get("selected_coin") is None:
 if union.empty:
     st.info("Keine Daten für den gewählten Filter. Scanne Watchlist oder aktualisiere Top-100.")
 else:
-    # Anzeige-Dataset (keine String-Vorformatierung -> echte Zahlen bleiben erhalten)
     display = union.copy()
 
-    # Datenquelle-Kürzel
     def _src_short(s: str) -> str:
         s = (s or "").lower()
         if "binance" in s: return "Bi"
@@ -633,25 +625,20 @@ else:
         return ""
     display["src"] = display.get("source", "").map(_src_short) if "source" in display.columns else ""
 
-    # Standard-Sortierung nach Rang
     if "rank" in display.columns:
         display = display.sort_values("rank", kind="stable").reset_index(drop=True)
 
-    # Spalten-Set (inkl. id)
     show_cols = ["universe","rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
                  "Resistance","Support","Breakout_MA","Breakout_Resistance","Entry_Signal",
                  "status","src","id"]
     for c in show_cols:
         if c not in display.columns:
             display[c] = np.nan if c in ["price","MA20","MA50","Vol_Surge_x","Resistance","Support"] else ""
-
     display = display[show_cols].copy()
 
-    # ---- AG Grid Konfiguration ----
     gb = GridOptionsBuilder.from_dataframe(display)
     gb.configure_default_column(filter=True, sortable=True, resizable=True)
 
-    # ValueFormatter (max 2 Nachkommastellen, mit Tausendertrenner)
     fmt2 = JsCode("""
         function(params){
             if (params.value == null || isNaN(params.value)) return '';
@@ -664,8 +651,6 @@ else:
             return Number(params.value).toLocaleString(undefined,{maximumFractionDigits:2}) + 'x';
         }
     """)
-
-    # Zellfarben: Vol_Surge_x (grün ≥ Schwelle, rot < 0.8, sonst neutral)
     vol_thresh_js = float(st.session_state["vol_surge_thresh"])
     cell_style_vol = JsCode(f"""
         function(params) {{
@@ -676,8 +661,6 @@ else:
             return {{}};
         }}
     """)
-
-    # Zellfarben: Bool (True -> grün, False -> rot)
     cell_style_bool = JsCode("""
         function(params){
             if (params.value === true)  return {backgroundColor:'#e6ffed', color:'#065f46', fontWeight:'600', textAlign:'center'};
@@ -686,9 +669,9 @@ else:
         }
     """)
 
-    gb.configure_column("id", hide=True)  # interne ID
-    gb.configure_column("universe", headerName="Ursprung", hide=True)
-    gb.configure_column("symbol", headerName="Ticker", hide=True)
+    gb.configure_column("id", hide=True)
+    gb.configure_column("universe", headerName="Ursprung", hide=True)   # ausgeblendet
+    gb.configure_column("symbol", headerName="Ticker", hide=True)       # ausgeblendet
     gb.configure_column("rank", headerName="Rang", width=90, sort="asc")
     gb.configure_column("name", headerName="Name", width=140)
 
@@ -706,7 +689,6 @@ else:
     gb.configure_column("status", headerName="Status", width=90)
     gb.configure_column("src", headerName="Daten", width=80)
 
-    # Auswahl via Doppelklick (kein Checkbox-Auswahlfeld)
     gb.configure_selection(selection_mode="single", use_checkbox=False)
     js_dbl = JsCode("""
         function(e) {
@@ -734,112 +716,62 @@ else:
         fit_columns_on_grid_load=True
     )
 
-    # Doppelklick → Selection → aktiver Coin
     sel = grid.get("selected_rows", [])
     if sel:
         chosen_id = str(sel[0]["id"])
         if st.session_state.get("selected_coin") != chosen_id:
             st.session_state["selected_coin"] = chosen_id
-            st.query_params.update({"coin": chosen_id})  # Permalink setzen
+            st.query_params.update({"coin": chosen_id})
             st.rerun()
 
-# --- Watchlist-Add: aus Selektion und gesammelt (alle Entry-Signale in aktueller Ansicht) ---
-
-# --- Watchlist-Add (stabil via Pending-Queue im Session State) ---
+# ---------- Watchlist-Add (einziger, stabiler Block) ----------
 def _binance_base(asset_or_symbol: str) -> str:
     s = str(asset_or_symbol).upper()
     return s[:-4] if s.endswith("USDT") else s
 
-# Pending-Liste initialisieren
-st.session_state.setdefault("pending_add_to_watchlist", [])
-
 add_col1, add_col2 = st.columns([1,1])
-
-# 1) Selektierte Zeile -> zur Watchlist (legt nur pending an)
-if sel:
+# (A) Selektierte Zeile → Pending-Liste
+if 'sel' in locals() and sel:
     _sel_id = str(sel[0]["id"])
     _sel_base = _binance_base(_sel_id)
-    if add_col1.button(f"➕ {_sel_base} zur Watchlist", key=f"add_wl_{_sel_id}"):
+    if add_col1.button(f"➕ {_sel_base} zur Watchlist", key=f"add_wl_btn_{_sel_id}"):
         if _sel_base not in st.session_state["pending_add_to_watchlist"]:
             st.session_state["pending_add_to_watchlist"].append(_sel_base)
         st.rerun()
 else:
     add_col1.write("")
 
-# 2) Alle Entry-Signale in aktueller Ansicht -> pending
-if add_col2.button("➕ Alle Entry-Signale (sichtbar) zur Watchlist", key="add_all_entries"):
-    to_add = []
-    for _, row in display.iterrows():
-        try:
-            if bool(row.get("Entry_Signal", False)) and str(row.get("status","")) == "ok":
-                _base = _binance_base(str(row["id"]))
-                if _base not in st.session_state["pending_add_to_watchlist"]:
-                    to_add.append(_base)
-        except Exception:
-            continue
-    if to_add:
-        st.session_state["pending_add_to_watchlist"].extend(to_add)
-    st.rerun()
-
-# 3) Pending wirklich einspielen (nach dem Rerun ganz sicher)
-if st.session_state["pending_add_to_watchlist"]:
-    # Merge in die echte Watchlist (ohne Duplikate, Reihenfolge bewahren)
-    wl = list(st.session_state.get("selected_ids", []))
-    for x in st.session_state["pending_add_to_watchlist"]:
-        if x not in wl:
-            wl.append(x)
-    st.session_state["pending_add_to_watchlist"] = []
-    st.session_state["selected_ids"] = wl
-    st.success("Watchlist aktualisiert.")
-    # kein weiterer rerun nötig: Sidebar-Merge (Fix 1) hält alles stabil
-
-# 1) Selektierte Zeile -> zur Watchlist
-if sel:
-    _sel_id = str(sel[0]["id"])
-    _sel_base = _binance_base(_sel_id)
-    if add_col1.button(f"➕ {_sel_base} zur Watchlist", key=f"add_wl_{_sel_id}"):
-        st.session_state.setdefault("selected_ids", [])
-        if _sel_base not in st.session_state["selected_ids"] and _sel_id not in st.session_state["selected_ids"]:
-            st.session_state["selected_ids"].append(_sel_base)   # Base-Asset (z.B. RNDR)
-            st.success(f"{_sel_base} wurde zur Watchlist hinzugefügt.")
-            st.rerun()
-    else:
-        add_col1.write("")
-
-    # 2) Alle Entry-Signale der aktuellen Tabelle -> zur Watchlist
-    if add_col2.button("➕ Alle Entry-Signale (sichtbar) zur Watchlist", key="add_all_entries"):
-        st.session_state.setdefault("selected_ids", [])
+# (B) Alle sichtbaren Entry-Signale → Pending
+if 'display' in locals():
+    if add_col2.button("➕ Alle Entry-Signale (sichtbar) zur Watchlist", key="add_all_entries_btn"):
         to_add = []
         for _, row in display.iterrows():
             try:
                 if bool(row.get("Entry_Signal", False)) and str(row.get("status","")) == "ok":
-                    _id = str(row["id"])
-                    _base = _binance_base(_id)
-                    if (_base not in st.session_state["selected_ids"]) and (_id not in st.session_state["selected_ids"]):
+                    _base = _binance_base(str(row["id"]))
+                    if _base not in st.session_state["pending_add_to_watchlist"]:
                         to_add.append(_base)
             except Exception:
                 continue
         if to_add:
-            st.session_state["selected_ids"].extend(to_add)
-            # Duplikate entfernen, Reihenfolge bewahren
-            seen = set()
-            st.session_state["selected_ids"] = [x for x in st.session_state["selected_ids"] if not (x in seen or seen.add(x))]
-            st.success(f"Hinzugefügt: {', '.join(to_add)}")
-            st.rerun()
-        else:
-            st.info("Keine neuen Entry-Signale zum Hinzufügen gefunden.")
-
-    if st.button("Aktive Auswahl zurücksetzen"):
-        st.session_state["selected_coin"] = None
-        if "coin" in st.query_params: del st.query_params["coin"]
+            st.session_state["pending_add_to_watchlist"].extend(to_add)
         st.rerun()
+
+# (C) Pending → echte Watchlist (einmal zentral, ohne doppelte Buttons)
+if st.session_state["pending_add_to_watchlist"]:
+    wl = list(st.session_state.get("selected_ids", []))
+    for x in st.session_state["pending_add_to_watchlist"]:
+        if x not in wl:
+            wl.append(x)
+    st.session_state["selected_ids"] = wl
+    st.session_state["pending_add_to_watchlist"] = []
+    st.success("Watchlist aktualisiert.")
 
 # ===================== Chart + Tools =====================
 st.markdown("---")
 active = st.session_state.get("selected_coin")
 
-# Falls keiner aktiv: versuche ersten Entry aus Union (nach aktuellem Filter)
-if not active and not union.empty:
+if not active and 'union' in locals() and not union.empty:
     df_e = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
     if not df_e.empty:
         active = str(df_e.iloc[0]["id"])
