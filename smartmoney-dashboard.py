@@ -1,12 +1,13 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v5.0 (AGGrid Double-Click Edition)
+# v5.1 (AGGrid + 3 Filter + Datenquelle)
 #  - Eine einzige Tabelle (Watchlist + Top-100) mit st-aggrid
 #  - Doppelklick -> genau 1 aktiver Coin (selected_coin), initial None
-#  - Filter: Alle / Nur Entry-Signal / Nur Watchlist
-#  - Telegram-Alerts (manuell + Auto-Scan) beibehalten
-#  - Cooldown & "Letzter Sync" persistent (Top-100)
+#  - Filter: Top-100 / Watchlist / Entry-Signale (kein "Alle")
+#  - "Ursprung" (Universe) & "Ticker" sind ausgeblendet
+#  - Neue Spalte "Daten" (Bi / Cg) zeigt Datenursprung an
+#  - Telegram-Alerts (manuell + Auto-Scan), Cooldown & Last-Sync
 #  - Tausenderformat, Permalink via st.query_params
 # -------------------------------------------------------------
 
@@ -120,7 +121,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/5.0 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/5.1 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -598,12 +599,14 @@ if not union.empty:
     union.sort_values(by=["id","_prio"], inplace=True)
     union = union.drop_duplicates(subset=["id"], keep="first").drop(columns=["_prio"])
 
-# Filter (radio)
-flt = st.radio("Filter", ["Alle", "Nur Entry-Signal", "Nur Watchlist"], horizontal=True)
-if flt == "Nur Entry-Signal":
-    union = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
-elif flt == "Nur Watchlist":
+# --------- Filter (nur 3 Optionen, kein "Alle") ----------
+flt = st.radio("Filter", ["Top-100", "Watchlist", "Entry-Signale"], horizontal=True)
+if flt == "Top-100":
+    union = union[union["universe"]=="Top100"]
+elif flt == "Watchlist":
     union = union[union["universe"]=="Watchlist"]
+else:  # Entry-Signale
+    union = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
 
 # Query-Param → aktiver Coin (nur wenn noch keiner gesetzt)
 if st.session_state.get("selected_coin") is None:
@@ -612,38 +615,57 @@ if st.session_state.get("selected_coin") is None:
         st.session_state["selected_coin"] = str(qp)
 
 if union.empty:
-    st.info("Noch keine Daten. Scanne Watchlist oder aktualisiere Top-100.")
+    st.info("Keine Daten für den gewählten Filter. Scanne Watchlist oder aktualisiere Top-100.")
 else:
-    # Anzeigeformat
+    # Anzeigeformat + Datenquelle-Kürzel
     display = union.copy()
     for c in ["price","MA20","MA50","Resistance","Support"]:
         if c in display.columns:
             display[c] = pd.to_numeric(display[c], errors="coerce").map(lambda x: fmt_money(x,4) if pd.notna(x) else "")
     if "Vol_Surge_x" in display.columns:
         display["Vol_Surge_x"] = pd.to_numeric(display["Vol_Surge_x"], errors="coerce").map(lambda x: f"{x:.2f}x" if pd.notna(x) else "")
+    # "Daten" = Quelle in kurz
+    def _src_short(s: str) -> str:
+        s = (s or "").lower()
+        if "binance" in s: return "Bi"
+        if "gecko" in s:   return "Cg"
+        return ""
+    display["src"] = display.get("source", "").map(_src_short) if "source" in display.columns else ""
 
+    # Sortierung standardmäßig nach Rang
+    if "rank" in display.columns:
+        display = display.sort_values("rank", kind="stable").reset_index(drop=True)
+
+    # Alle Spalten, aber "universe" & "symbol" ausgeblendet
     show_cols = ["universe","rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
-                 "Resistance","Support","Breakout_MA","Breakout_Resistance","Entry_Signal","status","id"]
-    # Fehlende Spalten auffüllen
+                 "Resistance","Support","Breakout_MA","Breakout_Resistance","Entry_Signal",
+                 "status","src","id"]
     for c in show_cols:
         if c not in display.columns:
             display[c] = ""
     display = display[show_cols].copy()
 
-    # ---- st-aggrid ohne Checkboxen, Doppelklick aktiviert ----
+    # ---- st-aggrid mit Doppelklick, ohne Checkboxen ----
     gb = GridOptionsBuilder.from_dataframe(display)
     gb.configure_default_column(filter=True, sortable=True, resizable=True)
-    gb.configure_column("id", hide=True)
-    gb.configure_column("universe", headerName="Ursprung", width=110)
-    gb.configure_column("rank", headerName="Rang", width=90)
+    gb.configure_column("id", hide=True)  # interne ID
+    gb.configure_column("universe", headerName="Ursprung", hide=True)
+    gb.configure_column("symbol", headerName="Ticker", hide=True)
+    gb.configure_column("rank", headerName="Rang", width=90, sort="asc")
     gb.configure_column("name", headerName="Name", width=140)
-    gb.configure_column("symbol", headerName="Ticker", width=100)
+    gb.configure_column("price", headerName="Price")
+    gb.configure_column("MA20", headerName="MA20")
+    gb.configure_column("MA50", headerName="MA50")
+    gb.configure_column("Vol_Surge_x", headerName="Vol x7d")
+    gb.configure_column("Resistance", headerName="Resistance")
+    gb.configure_column("Support", headerName="Support")
+    gb.configure_column("Breakout_MA", headerName="Breakout MA")
+    gb.configure_column("Breakout_Resistance", headerName="Breakout Resistance")
+    gb.configure_column("Entry_Signal", headerName="Entry")
+    gb.configure_column("status", headerName="status", width=90)
+    gb.configure_column("src", headerName="Daten", width=80)
 
-    # Keine Checkbox-Auswahl (Single-Select, ohne Checkboxen)
-    gb.configure_selection(
-        selection_mode="single",
-        use_checkbox=False
-    )
+    gb.configure_selection(selection_mode="single", use_checkbox=False)
 
     # Doppelklick -> selektiert genau die Zeile
     js_dbl = JsCode("""
@@ -681,7 +703,6 @@ else:
             st.query_params.update({"coin": chosen_id})  # Permalink setzen
             st.rerun()
 
-    # Reset-Button: Chart ausblenden und Permalink säubern
     if st.button("Aktive Auswahl zurücksetzen"):
         st.session_state["selected_coin"] = None
         if "coin" in st.query_params: del st.query_params["coin"]
@@ -691,7 +712,7 @@ else:
 st.markdown("---")
 active = st.session_state.get("selected_coin")
 
-# Falls keiner aktiv: versuche ersten Entry aus Union
+# Falls keiner aktiv: versuche ersten Entry aus Union (nach aktuellem Filter)
 if not active and not union.empty:
     df_e = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
     if not df_e.empty:
@@ -720,7 +741,7 @@ if active:
     if (d is None) or d.empty or (status_val != "ok"):
         st.warning("Keine Historie verfügbar (API-Limit, 451/403 oder leere Daten).")
     else:
-        st.caption(f"Datenquelle: {src_val or 'binance'}")
+        st.caption(f"Datenquelle: {('Bi' if 'binance' in (src_val or '').lower() else 'Cg')}")
         dfd = d.copy()
         dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
         dfd["price"]  = pd.to_numeric(dfd["price"], errors="coerce")
