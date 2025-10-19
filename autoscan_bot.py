@@ -153,7 +153,7 @@ def main():
             last_ts = state["last_alert"].get(sym, 0)
             if now - last_ts >= COOLDN:
                 name = sym.replace("USDT","")
-                link = (APPURL + (("?coin="+sym) if "?" not in APPURL else ("&coin="+sym)))) if APPURL else ""
+                link = (APPURL + (("?coin="+sym) if "?" not in APPURL else ("&coin="+sym))) if APPURL else ""
                 msg = f"🚨 Entry-Signal: {name} ({name}) erkannt.\n{link}".strip()
                 if send_telegram(msg):
                     hits.append(sym)
