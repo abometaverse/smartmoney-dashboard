@@ -1,0 +1,52 @@
+name: Autoscan & Telegram
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # alle 10 Minuten
+  workflow_dispatch:
+
+permissions:
+  contents: write   # erlaubt Commit des State-Files
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy
+
+      - name: Run autoscan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          APP_URL:            ${{ secrets.APP_URL }}   # z.B. https://smartmoney-dashboard.streamlit.app
+          TOP_N:              "100"
+          DAYS_HIST:          "120"
+          LOOKBACK:           "20"
+          VOL_SURGE:          "1.5"
+          ALERT_COOLDOWN_MIN: "120"      # 2 Stunden pro Coin
+          STATE_FILE:         "autoscan_state.json"
+        run: |
+          python autoscan_bot.py
+
+      - name: Commit state if changed
+        run: |
+          if git status --porcelain | grep autoscan_state.json; then
+            git config user.name  "autoscan-bot"
+            git config user.email "autoscan-bot@users.noreply.github.com"
+            git add autoscan_state.json
+            git commit -m "chore: update autoscan state [skip ci]" || true
+            git push
+          else
+            echo "No state changes."
+          fi
