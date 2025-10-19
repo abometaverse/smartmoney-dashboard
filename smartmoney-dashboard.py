@@ -1,7 +1,7 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v5.1 (AGGrid + 3 Filter + Datenquelle)
+# v5.2 (AGGrid Styling + 2 Dezimalstellen)
 #  - Eine einzige Tabelle (Watchlist + Top-100) mit st-aggrid
 #  - Doppelklick -> genau 1 aktiver Coin (selected_coin), initial None
 #  - Filter: Top-100 / Watchlist / Entry-Signale (kein "Alle")
@@ -9,6 +9,7 @@
 #  - Neue Spalte "Daten" (Bi / Cg) zeigt Datenursprung an
 #  - Telegram-Alerts (manuell + Auto-Scan), Cooldown & Last-Sync
 #  - Tausenderformat, Permalink via st.query_params
+#  - NEU: Zellfarben (Vol x7d / Breakout / Entry), max. 2 Dezimalstellen
 # -------------------------------------------------------------
 
 import math
@@ -121,7 +122,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/5.1 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/5.2 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -617,14 +618,10 @@ if st.session_state.get("selected_coin") is None:
 if union.empty:
     st.info("Keine Daten für den gewählten Filter. Scanne Watchlist oder aktualisiere Top-100.")
 else:
-    # Anzeigeformat + Datenquelle-Kürzel
+    # Anzeige-Dataset (keine String-Vorformatierung -> echte Zahlen bleiben erhalten)
     display = union.copy()
-    for c in ["price","MA20","MA50","Resistance","Support"]:
-        if c in display.columns:
-            display[c] = pd.to_numeric(display[c], errors="coerce").map(lambda x: fmt_money(x,4) if pd.notna(x) else "")
-    if "Vol_Surge_x" in display.columns:
-        display["Vol_Surge_x"] = pd.to_numeric(display["Vol_Surge_x"], errors="coerce").map(lambda x: f"{x:.2f}x" if pd.notna(x) else "")
-    # "Daten" = Quelle in kurz
+
+    # Datenquelle-Kürzel
     def _src_short(s: str) -> str:
         s = (s or "").lower()
         if "binance" in s: return "Bi"
@@ -632,42 +629,81 @@ else:
         return ""
     display["src"] = display.get("source", "").map(_src_short) if "source" in display.columns else ""
 
-    # Sortierung standardmäßig nach Rang
+    # Standard-Sortierung nach Rang
     if "rank" in display.columns:
         display = display.sort_values("rank", kind="stable").reset_index(drop=True)
 
-    # Alle Spalten, aber "universe" & "symbol" ausgeblendet
+    # Spalten-Set (inkl. id)
     show_cols = ["universe","rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
                  "Resistance","Support","Breakout_MA","Breakout_Resistance","Entry_Signal",
                  "status","src","id"]
     for c in show_cols:
         if c not in display.columns:
-            display[c] = ""
+            display[c] = np.nan if c in ["price","MA20","MA50","Vol_Surge_x","Resistance","Support"] else ""
+
     display = display[show_cols].copy()
 
-    # ---- st-aggrid mit Doppelklick, ohne Checkboxen ----
+    # ---- AG Grid Konfiguration ----
     gb = GridOptionsBuilder.from_dataframe(display)
     gb.configure_default_column(filter=True, sortable=True, resizable=True)
+
+    # ValueFormatter (max 2 Nachkommastellen, mit Tausendertrenner)
+    fmt2 = JsCode("""
+        function(params){
+            if (params.value == null || isNaN(params.value)) return '';
+            return Number(params.value).toLocaleString(undefined,{maximumFractionDigits:2});
+        }
+    """)
+    fmt2x = JsCode("""
+        function(params){
+            if (params.value == null || isNaN(params.value)) return '';
+            return Number(params.value).toLocaleString(undefined,{maximumFractionDigits:2}) + 'x';
+        }
+    """)
+
+    # Zellfarben: Vol_Surge_x (grün ≥ Schwelle, rot < 0.8, sonst neutral)
+    vol_thresh_js = float(st.session_state["vol_surge_thresh"])
+    cell_style_vol = JsCode(f"""
+        function(params) {{
+            var v = Number(params.value);
+            if (isNaN(v)) return {{}};
+            if (v >= {vol_thresh_js}) return {{backgroundColor:'#e6ffed', color:'#065f46', fontWeight:'600'}};
+            if (v < 0.80) return {{backgroundColor:'#ffecec', color:'#7f1d1d', fontWeight:'600'}};
+            return {{}};
+        }}
+    """)
+
+    # Zellfarben: Bool (True -> grün, False -> rot)
+    cell_style_bool = JsCode("""
+        function(params){
+            if (params.value === true)  return {backgroundColor:'#e6ffed', color:'#065f46', fontWeight:'600', textAlign:'center'};
+            if (params.value === false) return {backgroundColor:'#ffecec', color:'#7f1d1d', fontWeight:'600', textAlign:'center'};
+            return {};
+        }
+    """)
+
     gb.configure_column("id", hide=True)  # interne ID
     gb.configure_column("universe", headerName="Ursprung", hide=True)
     gb.configure_column("symbol", headerName="Ticker", hide=True)
     gb.configure_column("rank", headerName="Rang", width=90, sort="asc")
     gb.configure_column("name", headerName="Name", width=140)
-    gb.configure_column("price", headerName="Price")
-    gb.configure_column("MA20", headerName="MA20")
-    gb.configure_column("MA50", headerName="MA50")
-    gb.configure_column("Vol_Surge_x", headerName="Vol x7d")
-    gb.configure_column("Resistance", headerName="Resistance")
-    gb.configure_column("Support", headerName="Support")
-    gb.configure_column("Breakout_MA", headerName="Breakout MA")
-    gb.configure_column("Breakout_Resistance", headerName="Breakout Resistance")
-    gb.configure_column("Entry_Signal", headerName="Entry")
-    gb.configure_column("status", headerName="status", width=90)
+
+    gb.configure_column("price", headerName="Price", type=["rightAligned"], valueFormatter=fmt2)
+    gb.configure_column("MA20", headerName="MA20", type=["rightAligned"], valueFormatter=fmt2)
+    gb.configure_column("MA50", headerName="MA50", type=["rightAligned"], valueFormatter=fmt2)
+    gb.configure_column("Resistance", headerName="Resistance", type=["rightAligned"], valueFormatter=fmt2)
+    gb.configure_column("Support", headerName="Support", type=["rightAligned"], valueFormatter=fmt2)
+
+    gb.configure_column("Vol_Surge_x", headerName="Vol x7d", type=["rightAligned"], valueFormatter=fmt2x, cellStyle=cell_style_vol)
+    gb.configure_column("Breakout_MA", headerName="Breakout MA", cellStyle=cell_style_bool)
+    gb.configure_column("Breakout_Resistance", headerName="Breakout Resistance", cellStyle=cell_style_bool)
+    gb.configure_column("Entry_Signal", headerName="Entry", cellStyle=cell_style_bool)
+
+    gb.configure_column("status", headerName="Status", width=90)
     gb.configure_column("src", headerName="Daten", width=80)
 
+    # Auswahl via Doppelklick (kein Checkbox-Auswahlfeld)
     gb.configure_selection(selection_mode="single", use_checkbox=False)
-
-    # Doppelklick -> selektiert genau die Zeile
     js_dbl = JsCode("""
         function(e) {
             e.api.forEachNode(function(n){ n.setSelected(false); });
@@ -772,8 +808,8 @@ if active:
             ax_price.plot(d_daily.index, d_daily["price"], label="Price", linewidth=1.6)
             ax_price.plot(d_daily.index, d_daily["ma20"],  label="MA20", linewidth=1.0)
             ax_price.plot(d_daily.index, d_daily["ma50"],  label="MA50", linewidth=1.0)
-            if not np.isnan(r): ax_price.axhline(r, linestyle="--", label=f"Resistance {r:.3f}")
-            if not np.isnan(s): ax_price.axhline(s, linestyle="--", label=f"Support {s:.3f}")
+            if not np.isnan(r): ax_price.axhline(r, linestyle="--", label=f"Resistance {r:.2f}")
+            if not np.isnan(s): ax_price.axhline(s, linestyle="--", label=f"Support {s:.2f}")
             if not entries.empty:
                 ax_price.scatter(entries.index, entries["price"].astype(float), s=36, zorder=5, color="#16a34a", label="Entry (hist)")
             ax_vol.bar(d_daily.index, d_daily["volume"], alpha=0.28)
@@ -790,25 +826,25 @@ if active:
             plt.tight_layout()
             st.pyplot(fig, use_container_width=True)
 
-            # === Position & Trailing Stop ===
+            # === Position & Trailing Stop (2 Dezimalstellen) ===
             st.markdown("### 🧮 Position & Trailing Stop")
             c1, c2, c3, c4 = st.columns(4)
             last_px = float(d_daily['price'].iloc[-1])
             portfolio   = c1.number_input("Portfolio (USD)", min_value=0.0, value=8000.0, step=100.0, format="%.2f", key=f"pos_port_{active}")
             risk_pct    = c2.slider("Risiko/Trade (%)", 0.5, 3.0, 2.0, 0.1, key=f"pos_risk_{active}")
             stop_pct    = c3.slider("Stop-Entfernung (%)", 3.0, 25.0, 8.0, 0.5, key=f"pos_stop_{active}")
-            entry_price = c4.number_input("Entry-Preis", min_value=0.0, value=last_px, step=0.001, format="%.6f", key=f"pos_entry_{active}")
+            entry_price = c4.number_input("Entry-Preis", min_value=0.0, value=round(last_px,2), step=0.01, format="%.2f", key=f"pos_entry_{active}")
 
             max_loss = portfolio * (risk_pct/100.0)
             size_usd = max_loss / (stop_pct/100.0) if stop_pct>0 else 0.0
             size_qty = size_usd / entry_price if entry_price>0 else 0.0
-            st.write(f"**Max. Verlust:** ${max_loss:,.2f} • **Positionsgröße:** ${size_usd:,.2f} (~ {size_qty:,.4f} {str(active).upper()})")
+            st.write(f"**Max. Verlust:** ${max_loss:,.2f} • **Positionsgröße:** ${size_usd:,.2f} (~ {size_qty:,.2f} {str(active).upper()})")
 
             st.markdown("#### Trailing Stop")
             t1, t2 = st.columns(2)
             trail_pct = t1.slider("Trail (%)", 5.0, 25.0, 10.0, 0.5, key=f"trail_pct_{active}")
-            high_since_entry = t2.number_input("Höchster Kurs seit Entry", min_value=0.0, value=last_px, step=0.001, format="%.6f", key=f"trail_high_{active}")
+            high_since_entry = t2.number_input("Höchster Kurs seit Entry", min_value=0.0, value=round(last_px,2), step=0.01, format="%.2f", key=f"trail_high_{active}")
             tstop = trailing_stop(high_since_entry, trail_pct)
-            st.write(f"Trailing Stop bei **${tstop:,.3f}** (High {high_since_entry:,.3f}, Trail {trail_pct:.1f}%)")
+            st.write(f"Trailing Stop bei **${tstop:,.2f}** (High {high_since_entry:,.2f}, Trail {trail_pct:.1f}%)")
 else:
     st.info("Kein aktiver Coin. **Doppelklicke** eine Zeile in der Tabelle, um den Chart zu sehen.")
