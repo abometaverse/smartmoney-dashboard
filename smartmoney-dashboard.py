@@ -1,12 +1,11 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v5.4 (Watchlist nur über Tabelle; Entfernen möglich)
-#  - Eine Tabelle (Top-100 ∪ Watchlist ∪ Entry-Filter)
-#  - Doppelklick = aktiver Coin (einzig)
-#  - Watchlist: Hinzufügen/Entfernen ausschließlich über Tabelle
-#  - Telegram-Alerts, Auto-Scan (Top-100), Cooldown, Last-Sync
-#  - Tausenderformat, 2 Dezimalstellen, Bi/Cg-Badge, Query-Param
+# v5.5 (Fake-Entry-Test + Stabilität)
+#  - Sidebar: 🔧 Test (Fake-Entry-Alarm senden)
+#  - Aktiviert den Coin, setzt ?coin=..., legt/aktualisiert Zeile in Signals-Cache
+#  - Telegram testet mit Präfix [TEST]
+#  - Rest basiert auf v5.4 (eine Tabelle, DblClick, Watchlist via Tabelle)
 # -------------------------------------------------------------
 
 import math
@@ -46,7 +45,7 @@ def restore_state(keys):
 
 def ensure_defaults():
     defaults = {
-        "selected_ids": [],            # Watchlist leer -> nur über Tabelle befüllbar
+        "selected_ids": [],
         "vol_surge_thresh": 1.5,
         "lookback_res": 20,
         "alerts_enabled": True,
@@ -111,7 +110,7 @@ ensure_defaults()
 
 # ================= Constants & HTTP =================
 FIAT = "usd"
-CG_BASE = "https://api.coingecko.com/api/v3"   # nur für Namensauflösung
+CG_BASE = "https://api.coingecko.com/api/v3"
 BINANCE_ENDPOINTS = [
     "https://api.binance.com",
     "https://data-api.binance.vision",
@@ -121,7 +120,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/5.4 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/5.5 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -345,7 +344,7 @@ def telegram_alert_for_entries(df: pd.DataFrame) -> List[str]:
     st.session_state["auto_alerted_ids"] = list(sent_before)
     return alerted
 
-# ================= Sidebar (nur Settings, KEINE Watchlist-Eingabe) =================
+# ================= Sidebar (Settings + Test) =================
 st.sidebar.header("Settings")
 
 days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15, key="days_hist")
@@ -368,6 +367,57 @@ batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 15, int(st.se
 scan_now_batch = st.sidebar.button("🔔 Batch scannen", key="scan_btn_batch")
 if st.sidebar.button("🔄 Batch zurücksetzen", key="reset_batch_btn"):
     st.session_state["scan_index"] = 0
+
+# ---- 🔧 Test: Fake-Entry-Alarm
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔧 Test")
+test_coin_input = st.sidebar.text_input("Fake-Entry für (ID/BASE/BASEUSDT)", value="", key="test_coin_input")
+if st.sidebar.button("🚨 Test: Fake Entry-Alarm", key="btn_fake_entry"):
+    target = (test_coin_input or "").strip()
+    if not target:
+        st.sidebar.warning("Bitte Coin-ID/BASE/BASEUSDT eingeben (z. B. RNDR oder RNDRUSDT).")
+    else:
+        sym = resolve_to_binance_symbol(target) or target.upper()
+        set_active_coin(sym)
+        st.query_params.update({"coin": sym})
+        # sicherstellen, dass Signals-Cache eine Zeile hat
+        sig = st.session_state.get("signals_cache", pd.DataFrame()).copy()
+        name, symbol = (sym[:-4], sym[:-4]) if sym.endswith("USDT") else (sym, sym)
+        row = {
+            "universe": "Watchlist",
+            "rank": 0,
+            "name": name,
+            "symbol": symbol,
+            "id": sym,
+            "price": np.nan,
+            "MA20": np.nan,
+            "MA50": np.nan,
+            "Vol_Surge_x": np.nan,
+            "Resistance": np.nan,
+            "Support": np.nan,
+            "Breakout_MA": True,
+            "Breakout_Resistance": True,
+            "Distribution_Risk": False,
+            "Entry_Signal": True,
+            "status": "ok",
+            "source": "test"
+        }
+        if sig.empty:
+            sig = pd.DataFrame([row])
+        else:
+            if sym in set(sig["id"].astype(str)):
+                idx = sig.index[sig["id"].astype(str) == sym][0]
+                for k,v in row.items():
+                    sig.loc[idx, k] = v
+            else:
+                sig = pd.concat([pd.DataFrame([row]), sig], ignore_index=True)
+        st.session_state["signals_cache"] = sig
+
+        # Telegram senden (TEST)
+        app_url = st.secrets.get("APP_URL", "")
+        link = f"\n{app_url}?coin={sym}" if app_url else ""
+        send_telegram(f"[TEST] 🚨 Entry-Signal: {name} ({symbol}){link}")
+        st.sidebar.success("Test-Alarm gesendet & Coin aktiviert.")
 
 st.caption("🔒 Passwortschutz aktiv • Watchlist-Verwaltung ausschließlich über die Tabelle (➕/🗑).")
 
@@ -646,8 +696,8 @@ else:
     """)
 
     gb.configure_column("id", hide=True)
-    gb.configure_column("universe", headerName="Ursprung", hide=True)   # ausgeblendet
-    gb.configure_column("symbol", headerName="Ticker", hide=True)       # ausgeblendet
+    gb.configure_column("universe", headerName="Ursprung", hide=True)
+    gb.configure_column("symbol", headerName="Ticker", hide=True)
     gb.configure_column("rank", headerName="Rang", width=90, sort="asc")
     gb.configure_column("name", headerName="Name", width=140)
 
@@ -745,14 +795,13 @@ if 'display' in locals():
             st.session_state["pending_add_to_watchlist"].extend(to_add)
         st.rerun()
 
-# (D) Pending-Änderungen anwenden (einmal zentral, stabil)
+# (D) Pending-Änderungen anwenden
 changed = False
 if st.session_state["pending_add_to_watchlist"]:
     wl = list(st.session_state.get("selected_ids", []))
     for x in st.session_state["pending_add_to_watchlist"]:
         if x not in wl:
-            wl.append(x)
-            changed = True
+            wl.append(x); changed = True
     st.session_state["selected_ids"] = wl
     st.session_state["pending_add_to_watchlist"] = []
 
@@ -760,8 +809,7 @@ if st.session_state["pending_remove_from_watchlist"]:
     wl = list(st.session_state.get("selected_ids", []))
     for x in st.session_state["pending_remove_from_watchlist"]:
         if x in wl:
-            wl.remove(x)
-            changed = True
+            wl.remove(x); changed = True
     st.session_state["selected_ids"] = wl
     st.session_state["pending_remove_from_watchlist"] = []
 
