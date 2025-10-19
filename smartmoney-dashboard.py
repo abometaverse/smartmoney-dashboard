@@ -391,7 +391,11 @@ else:
 manual = st.sidebar.text_input("Zusätzliche ID (optional: CG-ID oder BASE/BASEUSDT)", value="", key="manual_id")
 if manual.strip(): selected_ids.append(manual.strip())
 if not selected_ids: selected_ids = ["bitcoin","ethereum"]
-st.session_state["selected_ids"] = selected_ids
+# ---- Merge statt Überschreiben: Sidebar-Selection ∪ bereits vorhandene (z.B. aus AG-Grid hinzugefügt)
+existing = list(st.session_state.get("selected_ids", []))
+merged = existing + [x for x in selected_ids if x not in existing]
+st.session_state["selected_ids"] = merged
+
 
 # Scan-Steuerung
 c_scan1, c_scan2 = st.sidebar.columns(2)
