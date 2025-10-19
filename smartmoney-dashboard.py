@@ -1,11 +1,15 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v5.3 (CMC-Link in Tabelle)
-#  - CMC-Link-Spalte ("CMC"): Klick öffnet CoinMarketCap-Suche für den Coin
-#  - Ermittelt Ticker aus 'symbol' oder aus 'id' (…USDT -> Basis)
-#  - Rest unverändert: eine Tabelle (Watchlist+Top100), Double-Click-Select,
-#    Zellfarben (Vol/Breakout/Entry), max. 2 Nachkommastellen, Telegram, Auto-Scan
+# v5.2 (AGGrid Styling + 2 Dezimalstellen)
+#  - Eine einzige Tabelle (Watchlist + Top-100) mit st-aggrid
+#  - Doppelklick -> genau 1 aktiver Coin (selected_coin), initial None
+#  - Filter: Top-100 / Watchlist / Entry-Signale (kein "Alle")
+#  - "Ursprung" (Universe) & "Ticker" sind ausgeblendet
+#  - Neue Spalte "Daten" (Bi / Cg) zeigt Datenursprung an
+#  - Telegram-Alerts (manuell + Auto-Scan), Cooldown & Last-Sync
+#  - Tausenderformat, Permalink via st.query_params
+#  - NEU: Zellfarben (Vol x7d / Breakout / Entry), max. 2 Dezimalstellen
 # -------------------------------------------------------------
 
 import math
@@ -108,7 +112,7 @@ ensure_defaults()
 
 # ================= Constants & HTTP =================
 FIAT = "usd"
-CG_BASE = "https://api.coingecko.com/api/v3"   # nur für Watchlist-Suche
+CG_BASE = "https://api.coingecko.com/api/v3"   # nur für Watchlist-Suche (Komfort)
 BINANCE_ENDPOINTS = [
     "https://api.binance.com",
     "https://data-api.binance.vision",
@@ -118,7 +122,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/5.3 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/5.2 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -203,7 +207,7 @@ def binance_top100_by_quote_volume() -> pd.DataFrame:
     df["rank"] = df.index + 1
     df["name"] = df["baseAsset"].str.upper()
     df["symbol_txt"] = df["baseAsset"].str.upper()
-    df["id"] = df["symbol"]
+    df["id"] = df["symbol"]  # ID = Binance-Symbol (stabil für Historie)
     return df[["rank","id","symbol","name","symbol_txt","quoteVolume"]].rename(columns={"symbol_txt":"symbol2"})
 
 # ---------- CoinGecko nur für Watchlist-Suche ----------
@@ -224,6 +228,7 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
 # ---------- CG-ID → Binance-Symbol Mapping ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_to_binance_symbol(coin_id_or_symbol: str) -> Optional[str]:
+    """Akzeptiert CG-ID ('render-token'), BaseAsset ('RNDR') oder BINANCE-Symbol ('RNDRUSDT')"""
     if not coin_id_or_symbol: return None
     s = str(coin_id_or_symbol).strip()
     if s.upper().endswith("USDT"):
@@ -583,24 +588,28 @@ if ts:
 watch_df = st.session_state.get("signals_cache", pd.DataFrame()).copy()
 top_df   = st.session_state.get("top100_df", pd.DataFrame()).copy()
 
+# Universe kennzeichnen
 if not watch_df.empty:
     watch_df["universe"] = "Watchlist"
 if not top_df.empty:
     top_df["universe"] = "Top100"
 
+# Union – Watchlist überschreibt Top-100 bei gleicher id
 union = pd.concat([watch_df.assign(_prio=0), top_df.assign(_prio=1)], ignore_index=True)
 if not union.empty:
     union.sort_values(by=["id","_prio"], inplace=True)
     union = union.drop_duplicates(subset=["id"], keep="first").drop(columns=["_prio"])
 
+# --------- Filter (nur 3 Optionen, kein "Alle") ----------
 flt = st.radio("Filter", ["Top-100", "Watchlist", "Entry-Signale"], horizontal=True)
 if flt == "Top-100":
     union = union[union["universe"]=="Top100"]
 elif flt == "Watchlist":
     union = union[union["universe"]=="Watchlist"]
-else:
+else:  # Entry-Signale
     union = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
 
+# Query-Param → aktiver Coin (nur wenn noch keiner gesetzt)
 if st.session_state.get("selected_coin") is None:
     qp = st.query_params.get("coin")
     if qp:
@@ -609,9 +618,10 @@ if st.session_state.get("selected_coin") is None:
 if union.empty:
     st.info("Keine Daten für den gewählten Filter. Scanne Watchlist oder aktualisiere Top-100.")
 else:
+    # Anzeige-Dataset (keine String-Vorformatierung -> echte Zahlen bleiben erhalten)
     display = union.copy()
 
-    # Datenquelle-Kürzel (Bi/Cg)
+    # Datenquelle-Kürzel
     def _src_short(s: str) -> str:
         s = (s or "").lower()
         if "binance" in s: return "Bi"
@@ -619,28 +629,14 @@ else:
         return ""
     display["src"] = display.get("source", "").map(_src_short) if "source" in display.columns else ""
 
-    # CMC-URL aus Symbol oder ID ableiten (Fallback: Suche)
-    def cmc_url_from_row(row) -> str:
-        sym = str(row.get("symbol", "") or "")
-        cid = str(row.get("id", "") or "")
-        base = ""
-        if sym:
-            base = sym.upper()
-        elif cid.upper().endswith("USDT"):
-            base = cid.upper()[:-4]
-        else:
-            base = cid.upper() or "BTC"
-        # Direkte Suche (robust, unabhängig vom CMC-Slug)
-        return f"https://coinmarketcap.com/currencies/search/?q={base}"
-
-    display["cmc"] = display.apply(cmc_url_from_row, axis=1)
-
+    # Standard-Sortierung nach Rang
     if "rank" in display.columns:
         display = display.sort_values("rank", kind="stable").reset_index(drop=True)
 
+    # Spalten-Set (inkl. id)
     show_cols = ["universe","rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
                  "Resistance","Support","Breakout_MA","Breakout_Resistance","Entry_Signal",
-                 "status","src","cmc","id"]
+                 "status","src","id"]
     for c in show_cols:
         if c not in display.columns:
             display[c] = np.nan if c in ["price","MA20","MA50","Vol_Surge_x","Resistance","Support"] else ""
@@ -651,7 +647,7 @@ else:
     gb = GridOptionsBuilder.from_dataframe(display)
     gb.configure_default_column(filter=True, sortable=True, resizable=True)
 
-    # Formatter (max 2 Dezimalstellen)
+    # ValueFormatter (max 2 Nachkommastellen, mit Tausendertrenner)
     fmt2 = JsCode("""
         function(params){
             if (params.value == null || isNaN(params.value)) return '';
@@ -665,7 +661,7 @@ else:
         }
     """)
 
-    # Zellfarben: Vol_Surge_x (grün ≥ Schwelle, rot < 0.8)
+    # Zellfarben: Vol_Surge_x (grün ≥ Schwelle, rot < 0.8, sonst neutral)
     vol_thresh_js = float(st.session_state["vol_surge_thresh"])
     cell_style_vol = JsCode(f"""
         function(params) {{
@@ -686,19 +682,9 @@ else:
         }
     """)
 
-    # CMC-Link Renderer
-    cell_renderer_cmc = JsCode("""
-        function(params){
-            var url = params.value;
-            if (!url) return '';
-            return "<a href='"+url+"' target='_blank' rel='noopener' style='text-decoration:none;font-weight:600;'>CMC</a>";
-        }
-    """)
-
-    gb.configure_column("id", hide=True)
+    gb.configure_column("id", hide=True)  # interne ID
     gb.configure_column("universe", headerName="Ursprung", hide=True)
     gb.configure_column("symbol", headerName="Ticker", hide=True)
-
     gb.configure_column("rank", headerName="Rang", width=90, sort="asc")
     gb.configure_column("name", headerName="Name", width=140)
 
@@ -716,8 +702,7 @@ else:
     gb.configure_column("status", headerName="Status", width=90)
     gb.configure_column("src", headerName="Daten", width=80)
 
-    gb.configure_column("cmc", headerName="CMC", width=80, cellRenderer=cell_renderer_cmc, sortable=False, filter=False)
-
+    # Auswahl via Doppelklick (kein Checkbox-Auswahlfeld)
     gb.configure_selection(selection_mode="single", use_checkbox=False)
     js_dbl = JsCode("""
         function(e) {
@@ -745,12 +730,13 @@ else:
         fit_columns_on_grid_load=True
     )
 
+    # Doppelklick → Selection → aktiver Coin
     sel = grid.get("selected_rows", [])
     if sel:
         chosen_id = str(sel[0]["id"])
         if st.session_state.get("selected_coin") != chosen_id:
             st.session_state["selected_coin"] = chosen_id
-            st.query_params.update({"coin": chosen_id})
+            st.query_params.update({"coin": chosen_id})  # Permalink setzen
             st.rerun()
 
     if st.button("Aktive Auswahl zurücksetzen"):
@@ -762,6 +748,7 @@ else:
 st.markdown("---")
 active = st.session_state.get("selected_coin")
 
+# Falls keiner aktiv: versuche ersten Entry aus Union (nach aktuellem Filter)
 if not active and not union.empty:
     df_e = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
     if not df_e.empty:
