@@ -639,12 +639,12 @@ else:
     gb.configure_column("name", headerName="Name", width=140)
     gb.configure_column("symbol", headerName="Ticker", width=100)
 
-    # Keine Checkbox-Auswahl
+    # Keine Checkbox-Auswahl (Single-Select, ohne Checkboxen)
     gb.configure_selection(
         selection_mode="single",
-        use_checkbox=False,
-        row_multi_select=False
+        use_checkbox=False
     )
+
     # Doppelklick -> selektiert genau die Zeile
     js_dbl = JsCode("""
         function(e) {
