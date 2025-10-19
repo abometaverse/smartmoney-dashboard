@@ -741,11 +741,53 @@ else:
 
 # --- Watchlist-Add: aus Selektion und gesammelt (alle Entry-Signale in aktueller Ansicht) ---
 
+# --- Watchlist-Add (stabil via Pending-Queue im Session State) ---
 def _binance_base(asset_or_symbol: str) -> str:
     s = str(asset_or_symbol).upper()
     return s[:-4] if s.endswith("USDT") else s
 
+# Pending-Liste initialisieren
+st.session_state.setdefault("pending_add_to_watchlist", [])
+
 add_col1, add_col2 = st.columns([1,1])
+
+# 1) Selektierte Zeile -> zur Watchlist (legt nur pending an)
+if sel:
+    _sel_id = str(sel[0]["id"])
+    _sel_base = _binance_base(_sel_id)
+    if add_col1.button(f"➕ {_sel_base} zur Watchlist", key=f"add_wl_{_sel_id}"):
+        if _sel_base not in st.session_state["pending_add_to_watchlist"]:
+            st.session_state["pending_add_to_watchlist"].append(_sel_base)
+        st.rerun()
+else:
+    add_col1.write("")
+
+# 2) Alle Entry-Signale in aktueller Ansicht -> pending
+if add_col2.button("➕ Alle Entry-Signale (sichtbar) zur Watchlist", key="add_all_entries"):
+    to_add = []
+    for _, row in display.iterrows():
+        try:
+            if bool(row.get("Entry_Signal", False)) and str(row.get("status","")) == "ok":
+                _base = _binance_base(str(row["id"]))
+                if _base not in st.session_state["pending_add_to_watchlist"]:
+                    to_add.append(_base)
+        except Exception:
+            continue
+    if to_add:
+        st.session_state["pending_add_to_watchlist"].extend(to_add)
+    st.rerun()
+
+# 3) Pending wirklich einspielen (nach dem Rerun ganz sicher)
+if st.session_state["pending_add_to_watchlist"]:
+    # Merge in die echte Watchlist (ohne Duplikate, Reihenfolge bewahren)
+    wl = list(st.session_state.get("selected_ids", []))
+    for x in st.session_state["pending_add_to_watchlist"]:
+        if x not in wl:
+            wl.append(x)
+    st.session_state["pending_add_to_watchlist"] = []
+    st.session_state["selected_ids"] = wl
+    st.success("Watchlist aktualisiert.")
+    # kein weiterer rerun nötig: Sidebar-Merge (Fix 1) hält alles stabil
 
 # 1) Selektierte Zeile -> zur Watchlist
 if sel:
