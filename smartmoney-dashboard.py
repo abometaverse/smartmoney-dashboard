@@ -739,6 +739,50 @@ else:
             st.query_params.update({"coin": chosen_id})  # Permalink setzen
             st.rerun()
 
+# --- Watchlist-Add: aus Selektion und gesammelt (alle Entry-Signale in aktueller Ansicht) ---
+
+def _binance_base(asset_or_symbol: str) -> str:
+    s = str(asset_or_symbol).upper()
+    return s[:-4] if s.endswith("USDT") else s
+
+add_col1, add_col2 = st.columns([1,1])
+
+# 1) Selektierte Zeile -> zur Watchlist
+if sel:
+    _sel_id = str(sel[0]["id"])
+    _sel_base = _binance_base(_sel_id)
+    if add_col1.button(f"➕ {_sel_base} zur Watchlist", key=f"add_wl_{_sel_id}"):
+        st.session_state.setdefault("selected_ids", [])
+        if _sel_base not in st.session_state["selected_ids"] and _sel_id not in st.session_state["selected_ids"]:
+            st.session_state["selected_ids"].append(_sel_base)   # Base-Asset (z.B. RNDR)
+            st.success(f"{_sel_base} wurde zur Watchlist hinzugefügt.")
+            st.rerun()
+    else:
+        add_col1.write("")
+
+    # 2) Alle Entry-Signale der aktuellen Tabelle -> zur Watchlist
+    if add_col2.button("➕ Alle Entry-Signale (sichtbar) zur Watchlist", key="add_all_entries"):
+        st.session_state.setdefault("selected_ids", [])
+        to_add = []
+        for _, row in display.iterrows():
+            try:
+                if bool(row.get("Entry_Signal", False)) and str(row.get("status","")) == "ok":
+                    _id = str(row["id"])
+                    _base = _binance_base(_id)
+                    if (_base not in st.session_state["selected_ids"]) and (_id not in st.session_state["selected_ids"]):
+                        to_add.append(_base)
+            except Exception:
+                continue
+        if to_add:
+            st.session_state["selected_ids"].extend(to_add)
+            # Duplikate entfernen, Reihenfolge bewahren
+            seen = set()
+            st.session_state["selected_ids"] = [x for x in st.session_state["selected_ids"] if not (x in seen or seen.add(x))]
+            st.success(f"Hinzugefügt: {', '.join(to_add)}")
+            st.rerun()
+        else:
+            st.info("Keine neuen Entry-Signale zum Hinzufügen gefunden.")
+
     if st.button("Aktive Auswahl zurücksetzen"):
         st.session_state["selected_coin"] = None
         if "coin" in st.query_params: del st.query_params["coin"]
