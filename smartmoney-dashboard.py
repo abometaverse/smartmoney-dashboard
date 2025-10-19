@@ -574,118 +574,136 @@ if st.session_state["auto_scan_enabled"]:
                     st.session_state["selected_coin"] = hits[0]
         st.session_state["auto_last_ts"] = time.time()
 
-# ===================== Eine Tabelle (Union) =====================
-st.markdown("---")
-hdr = st.container()
-cA, cB = hdr.columns([6,1])
-cA.subheader("📊 Watchlist + Top-100 (eine Tabelle)")
-ts = st.session_state.get("top100_last_sync_ts", 0.0)
-if ts:
-    cB.caption(f"Letzter Top-100-Sync: {time.strftime('%Y-%m-%d %H:%M', time.gmtime(ts))} UTC")
+# ---------- Watchlist + Top-100 in EINER Tabelle ----------
+st.markdown("## 🧰 Watchlist + Top-100 (eine Tabelle)")
 
-watch_df = st.session_state.get("signals_cache", pd.DataFrame()).copy()
-top_df   = st.session_state.get("top100_df", pd.DataFrame()).copy()
+# `watchlist_df` = deine Watchlist-Signals (signals_df)
+# `top100_df`    = bereits berechnete Top-100 (Binance)
+wl_df = st.session_state.get("signals_cache", pd.DataFrame()).copy()
+t100  = st.session_state.get("top100_df", pd.DataFrame()).copy()
 
-# Universe kennzeichnen
-if not watch_df.empty:
-    watch_df["universe"] = "Watchlist"
-if not top_df.empty:
-    top_df["universe"] = "Top100"
+# Vereinheitlichen: fehlende Spalten ergänzen
+need_cols = ["rank","id","name","symbol","price","MA20","MA50","Vol_Surge_x",
+             "Resistance","Support","Breakout_MA","Breakout_Resistance",
+             "Distribution_Risk","Entry_Signal","status","source"]
+for df in [wl_df, t100]:
+    for c in need_cols:
+        if c not in df.columns:
+            df[c] = np.nan
 
-# Union – Watchlist überschreibt Top-100 bei gleicher id
-union = pd.concat([watch_df.assign(_prio=0), top_df.assign(_prio=1)], ignore_index=True)
-if not union.empty:
-    union.sort_values(by=["id","_prio"], inplace=True)
-    union = union.drop_duplicates(subset=["id"], keep="first").drop(columns=["_prio"])
+# Ursprung markieren
+if not wl_df.empty:
+    wl_df["origin"] = "watchlist"
+if not t100.empty:
+    t100["origin"] = "top100"
 
-# Filter (radio)
-flt = st.radio("Filter", ["Alle", "Nur Entry-Signal", "Nur Watchlist"], horizontal=True)
-if flt == "Nur Entry-Signal":
-    union = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
-elif flt == "Nur Watchlist":
-    union = union[union["universe"]=="Watchlist"]
+combined_df = pd.concat([t100[need_cols+["origin"]],
+                         wl_df[need_cols+["origin"]]], ignore_index=True)
+# Rank aus Watchlist sinnvoll belegen (hohe Zahl, damit nach hinten sortiert)
+combined_df["rank"] = pd.to_numeric(combined_df["rank"], errors="coerce").fillna(9999).astype(int)
 
-# Query-Param → aktiver Coin (nur wenn noch keiner gesetzt)
-if st.session_state.get("selected_coin") is None:
-    qp = st.query_params.get("coin")
-    if qp:
-        st.session_state["selected_coin"] = str(qp)
+# --- Filter: Top-100 | Watchlist | Entry-Signal ---
+filter_choice = st.radio(
+    "Filter",
+    options=["Top-100", "Watchlist", "Nur Entry-Signal"],
+    horizontal=True,
+    index=0,
+    key="one_table_filter"
+)
 
-if union.empty:
-    st.info("Noch keine Daten. Scanne Watchlist oder aktualisiere Top-100.")
-else:
-    # Anzeigeformat
-    display = union.copy()
-    for c in ["price","MA20","MA50","Resistance","Support"]:
-        if c in display.columns:
-            display[c] = pd.to_numeric(display[c], errors="coerce").map(lambda x: fmt_money(x,4) if pd.notna(x) else "")
-    if "Vol_Surge_x" in display.columns:
-        display["Vol_Surge_x"] = pd.to_numeric(display["Vol_Surge_x"], errors="coerce").map(lambda x: f"{x:.2f}x" if pd.notna(x) else "")
+if filter_choice == "Top-100":
+    view = combined_df[combined_df["origin"] == "top100"].copy()
+elif filter_choice == "Watchlist":
+    view = combined_df[combined_df["origin"] == "watchlist"].copy()
+else:  # Nur Entry-Signal
+    view = combined_df[(combined_df["Entry_Signal"] == True) & (combined_df["status"] == "ok")].copy()
 
-    show_cols = ["universe","rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
-                 "Resistance","Support","Breakout_MA","Breakout_Resistance","Entry_Signal","status","id"]
-    # Fehlende Spalten auffüllen
-    for c in show_cols:
-        if c not in display.columns:
-            display[c] = ""
-    display = display[show_cols].copy()
-
-    # ---- st-aggrid ohne Checkboxen, Doppelklick aktiviert ----
-    gb = GridOptionsBuilder.from_dataframe(display)
-    gb.configure_default_column(filter=True, sortable=True, resizable=True)
-    gb.configure_column("id", hide=True)
-    gb.configure_column("universe", headerName="Ursprung", width=110)
-    gb.configure_column("rank", headerName="Rang", width=90)
-    gb.configure_column("name", headerName="Name", width=140)
-    gb.configure_column("symbol", headerName="Ticker", width=100)
-
-    # Keine Checkbox-Auswahl (Single-Select, ohne Checkboxen)
-    gb.configure_selection(
-        selection_mode="single",
-        use_checkbox=False
+# Für Anzeige formatieren (nur Darstellung – Originalwerte bleiben in `combined_df`)
+for c in ["price","MA20","MA50","Resistance","Support"]:
+    if c in view.columns:
+        view[c] = pd.to_numeric(view[c], errors="coerce")
+        view[c] = view[c].map(lambda x: f"{x:,.4f}" if pd.notna(x) else "")
+if "Vol_Surge_x" in view.columns:
+    view["Vol_Surge_x"] = pd.to_numeric(view["Vol_Surge_x"], errors="coerce").map(
+        lambda x: f"{x:.2f}x" if pd.notna(x) else ""
     )
 
-    # Doppelklick -> selektiert genau die Zeile
-    js_dbl = JsCode("""
-        function(e) {
-            e.api.forEachNode(function(n){ n.setSelected(false); });
-            e.node.setSelected(true);
-        }
-    """)
-    opts = gb.build()
-    if "columnDefs" in opts:
-        for col in opts["columnDefs"]:
-            col["checkboxSelection"] = False
-            col["headerCheckboxSelection"] = False
-    opts["rowSelection"] = "single"
-    opts["suppressRowClickSelection"] = True
-    opts["rowMultiSelectWithClick"] = False
-    opts["domLayout"] = "autoHeight"
-    opts["onRowDoubleClicked"] = js_dbl
+# ==== AG Grid (Einzeltabelle) ====
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
-    grid = AgGrid(
-        display,
-        gridOptions=opts,
-        theme="balham",
-        update_mode=GridUpdateMode.SELECTION_CHANGED,
-        allow_unsafe_jscode=True,
-        fit_columns_on_grid_load=True
-    )
+# Fallback für Rang, wenn leer
+view = view.fillna({"rank": 9999})
 
-    # Doppelklick → Selection → aktiver Coin
-    sel = grid.get("selected_rows", [])
-    if sel:
-        chosen_id = str(sel[0]["id"])
-        if st.session_state.get("selected_coin") != chosen_id:
-            st.session_state["selected_coin"] = chosen_id
-            st.query_params.update({"coin": chosen_id})  # Permalink setzen
+gb = GridOptionsBuilder.from_dataframe(
+    view[["rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
+          "Resistance","Support","Breakout_MA","Breakout_Resistance",
+          "Distribution_Risk","Entry_Signal","status","origin"]]
+)
+
+# Standard-Sortierung: Rang aufsteigend
+gb.configure_column("rank", headerName="Rang", type=["numericColumn"], width=80, sort="asc")
+gb.configure_column("name", headerName="Name", width=140)
+gb.configure_column("symbol", headerName="Ticker", width=90, hide=True)      # Ticker ausblenden
+gb.configure_column("origin", headerName="Ursprung", width=110, hide=True)   # Ursprung ausblenden
+gb.configure_column("price", headerName="Price", width=110)
+gb.configure_column("MA20", headerName="MA20", width=110)
+gb.configure_column("MA50", headerName="MA50", width=110)
+gb.configure_column("Vol_Surge_x", headerName="Vol x7d", width=90)
+gb.configure_column("Resistance", headerName="Resistance", width=120)
+gb.configure_column("Support", headerName="Support", width=110)
+gb.configure_column("Breakout_MA", headerName="Breakout MA", width=120)
+gb.configure_column("Breakout_Resistance", headerName="Break R", width=95)
+gb.configure_column("Distribution_Risk", headerName="Distr. Risk", width=95)
+gb.configure_column("Entry_Signal", headerName="Entry", width=80)
+gb.configure_column("status", headerName="status", width=80)
+
+# Kein Checkbox-Select, Double-Click aktiviert Coin
+gb.configure_grid_options(
+    suppressRowClickSelection=True,
+    rowSelection="single",
+)
+gb.configure_selection(selection_mode="single", use_checkbox=False)
+
+# JS: bei Doppelklick aktiviere Coin (einziger Aktiver)
+double_click_js = JsCode("""
+function(e) {
+    const idCol = 'id';
+    const api = e.api;
+    const row = e.node.data;
+    if (row && row[idCol]) {
+        // clear selection & select clicked
+        api.deselectAll();
+        e.node.setSelected(true);
+        // set python-side selection
+        return {'id': row[idCol]};
+    }
+    return null;
+}
+""")
+
+grid = AgGrid(
+    view.join(combined_df[["id"]], how="left"),   # stellt sicher, dass 'id' im GridRow vorhanden ist
+    gridOptions=gb.build(),
+    height=420,
+    theme="balham",
+    update_mode=GridUpdateMode.NO_UPDATE,
+    allow_unsafe_jscode=True,
+    enable_enterprise_modules=False,
+    events={"onRowDoubleClicked": double_click_js},
+)
+
+# Ergebnis Double-Click auswerten
+try:
+    if isinstance(grid, dict) and "data" in grid and "selected_rows" in grid:
+        pass  # alte Schnittstelle
+    # Neues Event-Objekt:
+    if "last_event" in grid and isinstance(grid["last_event"], dict):
+        evt = grid["last_event"]
+        if "id" in evt and evt["id"]:
+            set_active_coin(str(evt["id"]), source="combined_table")
             st.rerun()
-
-    # Reset-Button: Chart ausblenden und Permalink säubern
-    if st.button("Aktive Auswahl zurücksetzen"):
-        st.session_state["selected_coin"] = None
-        if "coin" in st.query_params: del st.query_params["coin"]
-        st.rerun()
+except Exception:
+    pass
 
 # ===================== Chart + Tools =====================
 st.markdown("---")
