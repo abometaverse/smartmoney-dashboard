@@ -777,17 +777,25 @@ if combined_frames:
             "Resistance","Support","Breakout_MA","Breakout_Resistance","Distribution_Risk","Entry_Signal","status","source"
         ]
         available_columns = [c for c in display_columns if c in filtered_df.columns]
-        column_config = {
+        column_config={
+            "rank": st.column_config.NumberColumn("Rang", format="%d", width="small"),
+            "name": st.column_config.TextColumn("Name"),
+            "symbol": st.column_config.TextColumn("Ticker", width="small"),
             "price": st.column_config.NumberColumn("Price", format="%.4f"),
             "MA20": st.column_config.NumberColumn("MA20", format="%.4f"),
             "MA50": st.column_config.NumberColumn("MA50", format="%.4f"),
             "Resistance": st.column_config.NumberColumn("Resistance", format="%.4f"),
             "Support": st.column_config.NumberColumn("Support", format="%.4f"),
             "Vol_Surge_x": st.column_config.NumberColumn("Vol Surge x", format="%.2f"),
-            "Breakout_MA": st.column_config.BooleanColumn("Breakout MA"),
-            "Breakout_Resistance": st.column_config.BooleanColumn("Breakout Resistance"),
-            "Distribution_Risk": st.column_config.BooleanColumn("Distribution Risk"),
-            "Entry_Signal": st.column_config.BooleanColumn("Entry Signal"),
+            # --- hier der wichtige Teil: Boolean -> CheckboxColumn ---
+            "Breakout_MA": st.column_config.CheckboxColumn("Breakout MA", disabled=True),
+            "Breakout_Resistance": st.column_config.CheckboxColumn("Breakout Resistance", disabled=True),
+            "Distribution_Risk": st.column_config.CheckboxColumn("Distribution Risk", disabled=True),
+            "Entry_Signal": st.column_config.CheckboxColumn("Entry Signal", disabled=True),
+            # versteckte technische Spalten (falls vorhanden)
+            "status": st.column_config.TextColumn("Status", width="small"),
+            "source": st.column_config.TextColumn("Quelle", width="small"),
+            "id": st.column_config.TextColumn("id", disabled=True),  # kannst du auch hide’n, wenn du möchtest
         }
         st.dataframe(
             filtered_df[available_columns],
