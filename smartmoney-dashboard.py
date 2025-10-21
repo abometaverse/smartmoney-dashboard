@@ -1,11 +1,12 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v5.5 (Fake-Entry-Test + Stabilität)
-#  - Sidebar: 🔧 Test (Fake-Entry-Alarm senden)
-#  - Aktiviert den Coin, setzt ?coin=..., legt/aktualisiert Zeile in Signals-Cache
-#  - Telegram testet mit Präfix [TEST]
-#  - Rest basiert auf v5.4 (eine Tabelle, DblClick, Watchlist via Tabelle)
+# v5.7
+#  - Persistenz: Settings + Watchlist + aktiver Coin in URL (st.query_params)
+#  - Tabelle: fester Header (AG Grid mit Höhe/Scroll), Dist_Risk-Spalte
+#  - Signal-Legende unterhalb der Tabelle
+#  - Beibehaltung: Auto-Scan + Telegram, Fake-Entry-Test, DblClick-Auswahl,
+#    eine kombinierte Tabelle (Top100 + Watchlist + Entry-Filter)
 # -------------------------------------------------------------
 
 import math
@@ -72,6 +73,58 @@ def ensure_defaults():
 def set_active_coin(coin_id: str):
     st.session_state["selected_coin"] = str(coin_id)
 
+# ---------- URL Persistenz (Settings/Watchlist) ----------
+# Wir serialisieren Settings & Watchlist in st.query_params.
+# Beim Start laden, danach bei Änderungen zurückschreiben.
+URL_KEYS = [
+    "days_hist","vol_surge_thresh","lookback_res","batch_size_slider",
+    "auto_scan_enabled","auto_scan_hours","top100_cooldown_min",
+    "selected_coin","selected_ids"  # selected_ids als komma-separierte BASE/IDs
+]
+
+def _to_str_bool(v: bool) -> str:
+    return "1" if bool(v) else "0"
+
+def _from_str_bool(s: Optional[str]) -> bool:
+    return str(s) == "1"
+
+def load_from_query_params():
+    qp = st.query_params
+    if not qp: 
+        return
+    try:
+        if "days_hist" in qp: st.session_state["days_hist"] = int(qp.get("days_hist"))
+        if "vol_surge_thresh" in qp: st.session_state["vol_surge_thresh"] = float(qp.get("vol_surge_thresh"))
+        if "lookback_res" in qp: st.session_state["lookback_res"] = int(qp.get("lookback_res"))
+        if "batch_size_slider" in qp: st.session_state["batch_size_slider"] = int(qp.get("batch_size_slider"))
+        if "auto_scan_enabled" in qp: st.session_state["auto_scan_enabled"] = _from_str_bool(qp.get("auto_scan_enabled"))
+        if "auto_scan_hours" in qp: st.session_state["auto_scan_hours"] = float(qp.get("auto_scan_hours"))
+        if "top100_cooldown_min" in qp: st.session_state["top100_cooldown_min"] = int(qp.get("top100_cooldown_min"))
+        if "selected_coin" in qp and qp.get("selected_coin"): st.session_state["selected_coin"] = str(qp.get("selected_coin"))
+        if "selected_ids" in qp and qp.get("selected_ids"):
+            wl = [x for x in str(qp.get("selected_ids")).split(",") if x]
+            st.session_state["selected_ids"] = wl
+    except Exception:
+        # Ignoriere defekte Query-Strings still
+        pass
+
+def persist_to_query_params():
+    try:
+        q = {
+            "days_hist": str(int(st.session_state.get("days_hist", 90))),
+            "vol_surge_thresh": str(float(st.session_state.get("vol_surge_thresh", 1.5))),
+            "lookback_res": str(int(st.session_state.get("lookback_res", 20))),
+            "batch_size_slider": str(int(st.session_state.get("batch_size_slider", 3))),
+            "auto_scan_enabled": _to_str_bool(bool(st.session_state.get("auto_scan_enabled", False))),
+            "auto_scan_hours": str(float(st.session_state.get("auto_scan_hours", 1.0))),
+            "top100_cooldown_min": str(int(st.session_state.get("top100_cooldown_min", 15))),
+            "selected_coin": str(st.session_state.get("selected_coin") or ""),
+            "selected_ids": ",".join(st.session_state.get("selected_ids", []))
+        }
+        st.query_params.update(q)
+    except Exception:
+        pass
+
 # ================= Auth Gate =================
 def auth_gate() -> None:
     st.title("🧠 Smart Money Dashboard — Geschützt")
@@ -100,6 +153,8 @@ def auth_gate() -> None:
                 st.session_state["AUTH_OK"] = True
                 restore_state(PERSIST_KEYS)
                 ensure_defaults()
+                # URL laden (falls vorhanden)
+                load_from_query_params()
                 st.rerun()
             else:
                 st.error("Falsches Passwort.")
@@ -107,6 +162,8 @@ def auth_gate() -> None:
 
 auth_gate()
 ensure_defaults()
+# Beim (Re)Start: URL → Settings holen
+load_from_query_params()
 
 # ================= Constants & HTTP =================
 FIAT = "usd"
@@ -120,7 +177,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/5.5 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/5.7 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -379,8 +436,9 @@ if st.sidebar.button("🚨 Test: Fake Entry-Alarm", key="btn_fake_entry"):
     else:
         sym = resolve_to_binance_symbol(target) or target.upper()
         set_active_coin(sym)
+        # persist sofort
         st.query_params.update({"coin": sym})
-        # sicherstellen, dass Signals-Cache eine Zeile hat
+        # Signaleintrag für Test
         sig = st.session_state.get("signals_cache", pd.DataFrame()).copy()
         name, symbol = (sym[:-4], sym[:-4]) if sym.endswith("USDT") else (sym, sym)
         row = {
@@ -392,7 +450,7 @@ if st.sidebar.button("🚨 Test: Fake Entry-Alarm", key="btn_fake_entry"):
             "price": np.nan,
             "MA20": np.nan,
             "MA50": np.nan,
-            "Vol_Surge_x": np.nan,
+            "Vol_Surge_x": 2.0,
             "Resistance": np.nan,
             "Support": np.nan,
             "Breakout_MA": True,
@@ -413,7 +471,6 @@ if st.sidebar.button("🚨 Test: Fake Entry-Alarm", key="btn_fake_entry"):
                 sig = pd.concat([pd.DataFrame([row]), sig], ignore_index=True)
         st.session_state["signals_cache"] = sig
 
-        # Telegram senden (TEST)
         app_url = st.secrets.get("APP_URL", "")
         link = f"\n{app_url}?coin={sym}" if app_url else ""
         send_telegram(f"[TEST] 🚨 Entry-Signal: {name} ({symbol}){link}")
@@ -625,7 +682,7 @@ if not union.empty:
     union.sort_values(by=["id","_prio"], inplace=True)
     union = union.drop_duplicates(subset=["id"], keep="first").drop(columns=["_prio"])
 
-flt = st.radio("Filter", ["Top-100", "Watchlist", "Entry-Signale"], horizontal=True)
+flt = st.radio("Filter", ["Top-100", "Watchlist", "Entry-Signale"], horizontal=True, key="flt_radio")
 if flt == "Top-100":
     union = union[union["universe"]=="Top100"]
 elif flt == "Watchlist":
@@ -633,21 +690,25 @@ elif flt == "Watchlist":
 else:
     union = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
 
-# Query-Param → aktiver Coin
+# Query-Param → aktiver Coin (nur wenn nicht gesetzt)
 if st.session_state.get("selected_coin") is None:
-    qp = st.query_params.get("coin")
-    if qp:
-        st.session_state["selected_coin"] = str(qp)
+    qp_coin = st.query_params.get("coin")
+    if qp_coin:
+        st.session_state["selected_coin"] = str(qp_coin)
 
 if union.empty:
     st.info("Keine Daten für den gewählten Filter. Top-100 aktualisieren oder Watchlist scannen.")
 else:
     display = union.copy()
 
+    # Dist_Risk für Anzeige (aus Distribution_Risk)
+    display["Dist_Risk"] = display.get("Distribution_Risk", False)
+
     def _src_short(s: str) -> str:
         s = (s or "").lower()
         if "binance" in s: return "Bi"
         if "gecko" in s:   return "Cg"
+        if "test" in s:    return "T"
         return ""
     display["src"] = display.get("source", "").map(_src_short) if "source" in display.columns else ""
 
@@ -655,13 +716,14 @@ else:
         display = display.sort_values("rank", kind="stable").reset_index(drop=True)
 
     show_cols = ["universe","rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
-                 "Resistance","Support","Breakout_MA","Breakout_Resistance","Entry_Signal",
-                 "status","src","id"]
+                 "Resistance","Support","Breakout_MA","Breakout_Resistance","Dist_Risk",
+                 "Entry_Signal","status","src","id"]
     for c in show_cols:
         if c not in display.columns:
             display[c] = np.nan if c in ["price","MA20","MA50","Vol_Surge_x","Resistance","Support"] else ""
     display = display[show_cols].copy()
 
+    # ==== AG Grid (Header fix, Scroll) ====
     gb = GridOptionsBuilder.from_dataframe(display)
     gb.configure_default_column(filter=True, sortable=True, resizable=True)
 
@@ -696,8 +758,8 @@ else:
     """)
 
     gb.configure_column("id", hide=True)
-    gb.configure_column("universe", headerName="Ursprung", hide=True)
-    gb.configure_column("symbol", headerName="Ticker", hide=True)
+    gb.configure_column("universe", headerName="Ursprung", hide=True)  # wie gewünscht ausblenden
+    gb.configure_column("symbol", headerName="Ticker", hide=True)      # wie gewünscht ausblenden
     gb.configure_column("rank", headerName="Rang", width=90, sort="asc")
     gb.configure_column("name", headerName="Name", width=140)
 
@@ -711,35 +773,41 @@ else:
     gb.configure_column("Breakout_MA", headerName="Breakout MA", cellStyle=cell_style_bool)
     gb.configure_column("Breakout_Resistance", headerName="Breakout Resistance", cellStyle=cell_style_bool)
     gb.configure_column("Entry_Signal", headerName="Entry", cellStyle=cell_style_bool)
+    gb.configure_column("Dist_Risk", headerName="Dist_Risk", cellStyle=cell_style_bool)
 
     gb.configure_column("status", headerName="Status", width=90)
     gb.configure_column("src", headerName="Daten", width=80)
 
     gb.configure_selection(selection_mode="single", use_checkbox=False)
+
     js_dbl = JsCode("""
         function(e) {
             e.api.forEachNode(function(n){ n.setSelected(false); });
             e.node.setSelected(true);
         }
     """)
+
     opts = gb.build()
     if "columnDefs" in opts:
         for col in opts["columnDefs"]:
             col["checkboxSelection"] = False
             col["headerCheckboxSelection"] = False
+
+    # Header bleibt sichtbar, Grid hat eigene Scroll-Area
     opts["rowSelection"] = "single"
     opts["suppressRowClickSelection"] = True
     opts["rowMultiSelectWithClick"] = False
-    opts["domLayout"] = "autoHeight"
-    opts["onRowDoubleClicked"] = js_dbl
+    opts["domLayout"] = "normal"
 
+    # Höhe damit Scroll aktiv ist (Header fix)
     grid = AgGrid(
         display,
         gridOptions=opts,
         theme="balham",
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         allow_unsafe_jscode=True,
-        fit_columns_on_grid_load=True
+        fit_columns_on_grid_load=True,
+        height=520
     )
 
     sel = grid.get("selected_rows", [])
@@ -748,6 +816,7 @@ else:
         if st.session_state.get("selected_coin") != chosen_id:
             st.session_state["selected_coin"] = chosen_id
             st.query_params.update({"coin": chosen_id})
+            persist_to_query_params()
             st.rerun()
 
 # ---------- Watchlist: Add/Remove über Tabelle ----------
@@ -762,59 +831,41 @@ if 'sel' in locals() and sel:
     _sel_id = str(sel[0]["id"])
     _sel_base = _binance_base(_sel_id)
     if btn_col1.button(f"➕ {_sel_base} zur Watchlist", key=f"add_wl_btn_{_sel_id}"):
-        if _sel_base not in st.session_state["pending_add_to_watchlist"]:
-            st.session_state["pending_add_to_watchlist"].append(_sel_base)
+        if _sel_base not in st.session_state["selected_ids"]:
+            st.session_state["selected_ids"] = list(st.session_state["selected_ids"]) + [_sel_base]
+            persist_to_query_params()
         st.rerun()
 else:
     btn_col1.write("")
 
 # (B) Entfernen (nur im Watchlist-Filter sinnvoll)
-if 'sel' in locals() and sel and flt == "Watchlist":
+if 'sel' in locals() and sel and st.session_state.get("selected_ids") and _binance_base(str(sel[0]["id"])) in st.session_state["selected_ids"]:
     _sel_id2 = str(sel[0]["id"])
     _sel_base2 = _binance_base(_sel_id2)
     if btn_col2.button(f"🗑 {_sel_base2} aus Watchlist entfernen", key=f"rem_wl_btn_{_sel_id2}"):
-        if _sel_base2 not in st.session_state["pending_remove_from_watchlist"]:
-            st.session_state["pending_remove_from_watchlist"].append(_sel_base2)
+        wl = list(st.session_state.get("selected_ids", []))
+        if _sel_base2 in wl:
+            wl.remove(_sel_base2)
+            st.session_state["selected_ids"] = wl
+            persist_to_query_params()
         st.rerun()
 else:
     btn_col2.write("")
 
-# (C) Alle sichtbaren Entry-Signale → Pending-Add
-if 'display' in locals():
+# (C) Alle sichtbaren Entry-Signale → Add
+if 'display' in locals() and not display.empty:
     if st.button("➕ Alle Entry-Signale (sichtbar) zur Watchlist", key="add_all_entries_btn"):
-        to_add = []
+        wl = set(st.session_state.get("selected_ids", []))
         for _, row in display.iterrows():
             try:
                 if bool(row.get("Entry_Signal", False)) and str(row.get("status","")) == "ok":
-                    _base = _binance_base(str(row["id"]))
-                    if _base not in st.session_state["pending_add_to_watchlist"]:
-                        to_add.append(_base)
+                    wl.add(_binance_base(str(row["id"])))
             except Exception:
                 continue
-        if to_add:
-            st.session_state["pending_add_to_watchlist"].extend(to_add)
+        st.session_state["selected_ids"] = list(wl)
+        persist_to_query_params()
+        st.success("Entry-Signale zur Watchlist hinzugefügt.")
         st.rerun()
-
-# (D) Pending-Änderungen anwenden
-changed = False
-if st.session_state["pending_add_to_watchlist"]:
-    wl = list(st.session_state.get("selected_ids", []))
-    for x in st.session_state["pending_add_to_watchlist"]:
-        if x not in wl:
-            wl.append(x); changed = True
-    st.session_state["selected_ids"] = wl
-    st.session_state["pending_add_to_watchlist"] = []
-
-if st.session_state["pending_remove_from_watchlist"]:
-    wl = list(st.session_state.get("selected_ids", []))
-    for x in st.session_state["pending_remove_from_watchlist"]:
-        if x in wl:
-            wl.remove(x); changed = True
-    st.session_state["selected_ids"] = wl
-    st.session_state["pending_remove_from_watchlist"] = []
-
-if changed:
-    st.success("Watchlist aktualisiert.")
 
 # ===================== Chart + Tools =====================
 st.markdown("---")
@@ -825,6 +876,7 @@ if not active and 'union' in locals() and not union.empty:
     if not df_e.empty:
         active = str(df_e.iloc[0]["id"])
         st.session_state["selected_coin"] = active
+        persist_to_query_params()
 
 if active:
     name_badge, sym_badge = _name_and_symbol_any(active)
@@ -919,3 +971,21 @@ if active:
             st.write(f"Trailing Stop bei **${tstop:,.2f}** (High {high_since_entry:,.2f}, Trail {trail_pct:.1f}%)")
 else:
     st.info("Kein aktiver Coin. **Doppelklicke** eine Zeile in der Tabelle, um den Chart zu sehen.")
+
+# ---------- Signal-Legende ----------
+st.markdown("---")
+st.markdown("""
+**Signal-Legende:**
+
+- **Vol x7d**:  
+  Grün = Volumen ≥ Schwelle (Entry-Bedingung erfüllt) · Rot = < 0.8× 7-Tage-Ø (Distributionsgefahr)
+
+- **Breakout MA / Breakout Resistance / Entry**:  
+  Grün = True · Rot = False
+
+- **Dist_Risk** (Distribution Risk):  
+  Grün = False (keine Anzeichen) · Rot = True (Preis ↑ bei Volumen < 0.8× 7d-Ø)
+""")
+
+# --- Am Ende: Settings/Watchlist dauerhaft in URL schreiben ---
+persist_to_query_params()
