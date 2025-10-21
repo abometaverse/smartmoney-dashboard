@@ -1,12 +1,13 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v5.7
+# v5.8
 #  - Persistenz: Settings + Watchlist + aktiver Coin in URL (st.query_params)
-#  - Tabelle: fester Header (AG Grid mit Höhe/Scroll), Dist_Risk-Spalte
+#  - Tabelle: fester Header (AG Grid Höhe/Scroll), Dist_Risk-Spalte
 #  - Signal-Legende unterhalb der Tabelle
-#  - Beibehaltung: Auto-Scan + Telegram, Fake-Entry-Test, DblClick-Auswahl,
-#    eine kombinierte Tabelle (Top100 + Watchlist + Entry-Filter)
+#  - Union-Tabelle (Top100 + Watchlist + Entry-Filter)
+#  - DblClick-Aktivierung (onRowDoubleClicked) ohne Checkbox
+#  - Telegram & Auto-Scan bleiben erhalten; Fake-Entry-Test im Sidebar
 # -------------------------------------------------------------
 
 import math
@@ -30,7 +31,7 @@ PERSIST_KEYS = [
     "days_hist","batch_size_slider","scan_index","selected_coin",
     "top100_df","top100_last_sync_ts","top100_cooldown_min",
     "auto_scan_enabled","auto_scan_hours","auto_last_ts","auto_alerted_ids",
-    "signals_cache","history_cache","pending_add_to_watchlist","pending_remove_from_watchlist"
+    "signals_cache","history_cache"
 ]
 
 def save_state(keys):
@@ -62,9 +63,7 @@ def ensure_defaults():
         "auto_last_ts": 0.0,
         "auto_alerted_ids": [],
         "signals_cache": pd.DataFrame(),
-        "history_cache": {},
-        "pending_add_to_watchlist": [],
-        "pending_remove_from_watchlist": []
+        "history_cache": {}
     }
     for k,v in defaults.items():
         if k not in st.session_state:
@@ -73,13 +72,11 @@ def ensure_defaults():
 def set_active_coin(coin_id: str):
     st.session_state["selected_coin"] = str(coin_id)
 
-# ---------- URL Persistenz (Settings/Watchlist) ----------
-# Wir serialisieren Settings & Watchlist in st.query_params.
-# Beim Start laden, danach bei Änderungen zurückschreiben.
+# ---------- URL Persistenz ----------
 URL_KEYS = [
     "days_hist","vol_surge_thresh","lookback_res","batch_size_slider",
     "auto_scan_enabled","auto_scan_hours","top100_cooldown_min",
-    "selected_coin","selected_ids"  # selected_ids als komma-separierte BASE/IDs
+    "selected_coin","selected_ids"
 ]
 
 def _to_str_bool(v: bool) -> str:
@@ -90,22 +87,21 @@ def _from_str_bool(s: Optional[str]) -> bool:
 
 def load_from_query_params():
     qp = st.query_params
-    if not qp: 
+    if not qp:
         return
     try:
-        if "days_hist" in qp: st.session_state["days_hist"] = int(qp.get("days_hist"))
-        if "vol_surge_thresh" in qp: st.session_state["vol_surge_thresh"] = float(qp.get("vol_surge_thresh"))
-        if "lookback_res" in qp: st.session_state["lookback_res"] = int(qp.get("lookback_res"))
-        if "batch_size_slider" in qp: st.session_state["batch_size_slider"] = int(qp.get("batch_size_slider"))
-        if "auto_scan_enabled" in qp: st.session_state["auto_scan_enabled"] = _from_str_bool(qp.get("auto_scan_enabled"))
-        if "auto_scan_hours" in qp: st.session_state["auto_scan_hours"] = float(qp.get("auto_scan_hours"))
-        if "top100_cooldown_min" in qp: st.session_state["top100_cooldown_min"] = int(qp.get("top100_cooldown_min"))
-        if "selected_coin" in qp and qp.get("selected_coin"): st.session_state["selected_coin"] = str(qp.get("selected_coin"))
-        if "selected_ids" in qp and qp.get("selected_ids"):
+        if qp.get("days_hist"): st.session_state["days_hist"] = int(qp.get("days_hist"))
+        if qp.get("vol_surge_thresh"): st.session_state["vol_surge_thresh"] = float(qp.get("vol_surge_thresh"))
+        if qp.get("lookback_res"): st.session_state["lookback_res"] = int(qp.get("lookback_res"))
+        if qp.get("batch_size_slider"): st.session_state["batch_size_slider"] = int(qp.get("batch_size_slider"))
+        if qp.get("auto_scan_enabled"): st.session_state["auto_scan_enabled"] = _from_str_bool(qp.get("auto_scan_enabled"))
+        if qp.get("auto_scan_hours"): st.session_state["auto_scan_hours"] = float(qp.get("auto_scan_hours"))
+        if qp.get("top100_cooldown_min"): st.session_state["top100_cooldown_min"] = int(qp.get("top100_cooldown_min"))
+        if qp.get("selected_coin"): st.session_state["selected_coin"] = str(qp.get("selected_coin"))
+        if qp.get("selected_ids"):
             wl = [x for x in str(qp.get("selected_ids")).split(",") if x]
             st.session_state["selected_ids"] = wl
     except Exception:
-        # Ignoriere defekte Query-Strings still
         pass
 
 def persist_to_query_params():
@@ -153,7 +149,6 @@ def auth_gate() -> None:
                 st.session_state["AUTH_OK"] = True
                 restore_state(PERSIST_KEYS)
                 ensure_defaults()
-                # URL laden (falls vorhanden)
                 load_from_query_params()
                 st.rerun()
             else:
@@ -162,7 +157,6 @@ def auth_gate() -> None:
 
 auth_gate()
 ensure_defaults()
-# Beim (Re)Start: URL → Settings holen
 load_from_query_params()
 
 # ================= Constants & HTTP =================
@@ -177,7 +171,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/5.7 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/5.8 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -425,7 +419,7 @@ scan_now_batch = st.sidebar.button("🔔 Batch scannen", key="scan_btn_batch")
 if st.sidebar.button("🔄 Batch zurücksetzen", key="reset_batch_btn"):
     st.session_state["scan_index"] = 0
 
-# ---- 🔧 Test: Fake-Entry-Alarm
+# ---- Test: Fake-Entry-Alarm
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔧 Test")
 test_coin_input = st.sidebar.text_input("Fake-Entry für (ID/BASE/BASEUSDT)", value="", key="test_coin_input")
@@ -436,9 +430,7 @@ if st.sidebar.button("🚨 Test: Fake Entry-Alarm", key="btn_fake_entry"):
     else:
         sym = resolve_to_binance_symbol(target) or target.upper()
         set_active_coin(sym)
-        # persist sofort
         st.query_params.update({"coin": sym})
-        # Signaleintrag für Test
         sig = st.session_state.get("signals_cache", pd.DataFrame()).copy()
         name, symbol = (sym[:-4], sym[:-4]) if sym.endswith("USDT") else (sym, sym)
         row = {
@@ -573,7 +565,7 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
 def run_scan_full_watchlist():
     ids = list(st.session_state.get("selected_ids", []))
     if not ids:
-        st.warning("Watchlist ist leer. Füge Coins aus der Tabelle (Top-100/Entry) hinzu.")
+        st.warning("Watchlist ist leer. Füge Coins aus der Tabelle hinzu.")
         return pd.DataFrame(), {}
     df, cache = compute_rows_for_ids(ids, st.session_state["days_hist"], st.session_state["vol_surge_thresh"], st.session_state["lookback_res"], "Watchlist-Scan")
     return df, cache
@@ -645,7 +637,7 @@ if should_refresh or st.session_state["top100_df"].empty:
         if st.session_state.get("alerts_enabled", True) and should_refresh:
             telegram_alert_for_entries(df100_new)
 
-# Auto-Scan
+# Auto-Scan (Top-100 + Telegram)
 if st.session_state["auto_scan_enabled"]:
     last = float(st.session_state.get("auto_last_ts", 0.0) or 0.0)
     interval = float(st.session_state.get("auto_scan_hours", 1.0)) * 3600.0
@@ -700,8 +692,6 @@ if union.empty:
     st.info("Keine Daten für den gewählten Filter. Top-100 aktualisieren oder Watchlist scannen.")
 else:
     display = union.copy()
-
-    # Dist_Risk für Anzeige (aus Distribution_Risk)
     display["Dist_Risk"] = display.get("Distribution_Risk", False)
 
     def _src_short(s: str) -> str:
@@ -723,7 +713,6 @@ else:
             display[c] = np.nan if c in ["price","MA20","MA50","Vol_Surge_x","Resistance","Support"] else ""
     display = display[show_cols].copy()
 
-    # ==== AG Grid (Header fix, Scroll) ====
     gb = GridOptionsBuilder.from_dataframe(display)
     gb.configure_default_column(filter=True, sortable=True, resizable=True)
 
@@ -757,9 +746,10 @@ else:
         }
     """)
 
+    # Spalten konfigurieren
     gb.configure_column("id", hide=True)
-    gb.configure_column("universe", headerName="Ursprung", hide=True)  # wie gewünscht ausblenden
-    gb.configure_column("symbol", headerName="Ticker", hide=True)      # wie gewünscht ausblenden
+    gb.configure_column("universe", headerName="Ursprung", hide=True)  # ausgeblendet
+    gb.configure_column("symbol", headerName="Ticker", hide=True)      # ausgeblendet
     gb.configure_column("rank", headerName="Rang", width=90, sort="asc")
     gb.configure_column("name", headerName="Name", width=140)
 
@@ -778,28 +768,21 @@ else:
     gb.configure_column("status", headerName="Status", width=90)
     gb.configure_column("src", headerName="Daten", width=80)
 
+    # Auswahl: Single, ohne Checkbox; DblClick selektiert die Zeile
     gb.configure_selection(selection_mode="single", use_checkbox=False)
-
-    js_dbl = JsCode("""
-        function(e) {
+    opts = gb.build()
+    opts["rowSelection"] = "single"
+    opts["suppressRowClickSelection"] = True
+    opts["rowMultiSelectWithClick"] = False
+    opts["domLayout"] = "normal"
+    # onRowDoubleClicked -> select row programmatically
+    opts["onRowDoubleClicked"] = JsCode("""
+        function(e){
             e.api.forEachNode(function(n){ n.setSelected(false); });
             e.node.setSelected(true);
         }
     """)
 
-    opts = gb.build()
-    if "columnDefs" in opts:
-        for col in opts["columnDefs"]:
-            col["checkboxSelection"] = False
-            col["headerCheckboxSelection"] = False
-
-    # Header bleibt sichtbar, Grid hat eigene Scroll-Area
-    opts["rowSelection"] = "single"
-    opts["suppressRowClickSelection"] = True
-    opts["rowMultiSelectWithClick"] = False
-    opts["domLayout"] = "normal"
-
-    # Höhe damit Scroll aktiv ist (Header fix)
     grid = AgGrid(
         display,
         gridOptions=opts,
@@ -807,7 +790,7 @@ else:
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
-        height=520
+        height=520  # sorgt für Scrollbar -> Header bleibt oben
     )
 
     sel = grid.get("selected_rows", [])
@@ -819,14 +802,13 @@ else:
             persist_to_query_params()
             st.rerun()
 
-# ---------- Watchlist: Add/Remove über Tabelle ----------
+# ---------- Watchlist: Add/Remove (Buttons unter der Tabelle) ----------
 def _binance_base(asset_or_symbol: str) -> str:
     s = str(asset_or_symbol).upper()
     return s[:-4] if s.endswith("USDT") else s
 
 btn_col1, btn_col2 = st.columns([1,1])
 
-# (A) Selektierte Zeile → Pending-Add
 if 'sel' in locals() and sel:
     _sel_id = str(sel[0]["id"])
     _sel_base = _binance_base(_sel_id)
@@ -838,7 +820,6 @@ if 'sel' in locals() and sel:
 else:
     btn_col1.write("")
 
-# (B) Entfernen (nur im Watchlist-Filter sinnvoll)
 if 'sel' in locals() and sel and st.session_state.get("selected_ids") and _binance_base(str(sel[0]["id"])) in st.session_state["selected_ids"]:
     _sel_id2 = str(sel[0]["id"])
     _sel_base2 = _binance_base(_sel_id2)
@@ -851,21 +832,6 @@ if 'sel' in locals() and sel and st.session_state.get("selected_ids") and _binan
         st.rerun()
 else:
     btn_col2.write("")
-
-# (C) Alle sichtbaren Entry-Signale → Add
-if 'display' in locals() and not display.empty:
-    if st.button("➕ Alle Entry-Signale (sichtbar) zur Watchlist", key="add_all_entries_btn"):
-        wl = set(st.session_state.get("selected_ids", []))
-        for _, row in display.iterrows():
-            try:
-                if bool(row.get("Entry_Signal", False)) and str(row.get("status","")) == "ok":
-                    wl.add(_binance_base(str(row["id"])))
-            except Exception:
-                continue
-        st.session_state["selected_ids"] = list(wl)
-        persist_to_query_params()
-        st.success("Entry-Signale zur Watchlist hinzugefügt.")
-        st.rerun()
 
 # ===================== Chart + Tools =====================
 st.markdown("---")
