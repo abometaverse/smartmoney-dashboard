@@ -1,11 +1,12 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v6.0
-#  - Double-Click in AG Grid aktiviert Coin (onRowDoubleClicked)
-#  - Stabile Persistenz aller Settings & Watchlist via st.query_params
-#  - Dist_Risk-Spalte, fixierter Tabellen-Header (eigene Scroll-Area)
-#  - Auto-Scan & Telegram + Fake-Entry-Test bestehen
+# v5.7
+#  - Persistenz: Settings + Watchlist + aktiver Coin in URL (st.query_params)
+#  - Tabelle: fester Header (AG Grid mit Höhe/Scroll), Dist_Risk-Spalte
+#  - Signal-Legende unterhalb der Tabelle
+#  - Beibehaltung: Auto-Scan + Telegram, Fake-Entry-Test, DblClick-Auswahl,
+#    eine kombinierte Tabelle (Top100 + Watchlist + Entry-Filter)
 # -------------------------------------------------------------
 
 import math
@@ -29,8 +30,19 @@ PERSIST_KEYS = [
     "days_hist","batch_size_slider","scan_index","selected_coin",
     "top100_df","top100_last_sync_ts","top100_cooldown_min",
     "auto_scan_enabled","auto_scan_hours","auto_last_ts","auto_alerted_ids",
-    "signals_cache","history_cache"
+    "signals_cache","history_cache","pending_add_to_watchlist","pending_remove_from_watchlist"
 ]
+
+def save_state(keys):
+    for k in keys:
+        if k in st.session_state:
+            st.session_state[f"_saved_{k}"] = st.session_state[k]
+
+def restore_state(keys):
+    for k in keys:
+        saved_key = f"_saved_{k}"
+        if saved_key in st.session_state:
+            st.session_state[k] = st.session_state[saved_key]
 
 def ensure_defaults():
     defaults = {
@@ -50,7 +62,9 @@ def ensure_defaults():
         "auto_last_ts": 0.0,
         "auto_alerted_ids": [],
         "signals_cache": pd.DataFrame(),
-        "history_cache": {}
+        "history_cache": {},
+        "pending_add_to_watchlist": [],
+        "pending_remove_from_watchlist": []
     }
     for k,v in defaults.items():
         if k not in st.session_state:
@@ -59,49 +73,55 @@ def ensure_defaults():
 def set_active_coin(coin_id: str):
     st.session_state["selected_coin"] = str(coin_id)
 
-# ---------- URL Persistenz ----------
-def _b(v: bool) -> str: return "1" if v else "0"
-def _ub(s: Optional[str]) -> bool: return str(s) == "1"
-
+# ---------- URL Persistenz (Settings/Watchlist) ----------
+# Wir serialisieren Settings & Watchlist in st.query_params.
+# Beim Start laden, danach bei Änderungen zurückschreiben.
 URL_KEYS = [
     "days_hist","vol_surge_thresh","lookback_res","batch_size_slider",
-    "alerts_enabled","auto_scan_enabled","auto_scan_hours","top100_cooldown_min",
-    "selected_coin","selected_ids"
+    "auto_scan_enabled","auto_scan_hours","top100_cooldown_min",
+    "selected_coin","selected_ids"  # selected_ids als komma-separierte BASE/IDs
 ]
+
+def _to_str_bool(v: bool) -> str:
+    return "1" if bool(v) else "0"
+
+def _from_str_bool(s: Optional[str]) -> bool:
+    return str(s) == "1"
 
 def load_from_query_params():
     qp = st.query_params
-    if not qp: return
+    if not qp: 
+        return
     try:
         if "days_hist" in qp: st.session_state["days_hist"] = int(qp.get("days_hist"))
         if "vol_surge_thresh" in qp: st.session_state["vol_surge_thresh"] = float(qp.get("vol_surge_thresh"))
         if "lookback_res" in qp: st.session_state["lookback_res"] = int(qp.get("lookback_res"))
         if "batch_size_slider" in qp: st.session_state["batch_size_slider"] = int(qp.get("batch_size_slider"))
-        if "alerts_enabled" in qp: st.session_state["alerts_enabled"] = _ub(qp.get("alerts_enabled"))
-        if "auto_scan_enabled" in qp: st.session_state["auto_scan_enabled"] = _ub(qp.get("auto_scan_enabled"))
+        if "auto_scan_enabled" in qp: st.session_state["auto_scan_enabled"] = _from_str_bool(qp.get("auto_scan_enabled"))
         if "auto_scan_hours" in qp: st.session_state["auto_scan_hours"] = float(qp.get("auto_scan_hours"))
         if "top100_cooldown_min" in qp: st.session_state["top100_cooldown_min"] = int(qp.get("top100_cooldown_min"))
-        if "selected_coin" in qp and qp.get("selected_coin"):
-            st.session_state["selected_coin"] = str(qp.get("selected_coin"))
+        if "selected_coin" in qp and qp.get("selected_coin"): st.session_state["selected_coin"] = str(qp.get("selected_coin"))
         if "selected_ids" in qp and qp.get("selected_ids"):
-            st.session_state["selected_ids"] = [x for x in str(qp.get("selected_ids")).split(",") if x]
+            wl = [x for x in str(qp.get("selected_ids")).split(",") if x]
+            st.session_state["selected_ids"] = wl
     except Exception:
+        # Ignoriere defekte Query-Strings still
         pass
 
 def persist_to_query_params():
     try:
-        st.query_params.update({
+        q = {
             "days_hist": str(int(st.session_state.get("days_hist", 90))),
             "vol_surge_thresh": str(float(st.session_state.get("vol_surge_thresh", 1.5))),
             "lookback_res": str(int(st.session_state.get("lookback_res", 20))),
             "batch_size_slider": str(int(st.session_state.get("batch_size_slider", 3))),
-            "alerts_enabled": _b(bool(st.session_state.get("alerts_enabled", True))),
-            "auto_scan_enabled": _b(bool(st.session_state.get("auto_scan_enabled", False))),
+            "auto_scan_enabled": _to_str_bool(bool(st.session_state.get("auto_scan_enabled", False))),
             "auto_scan_hours": str(float(st.session_state.get("auto_scan_hours", 1.0))),
             "top100_cooldown_min": str(int(st.session_state.get("top100_cooldown_min", 15))),
             "selected_coin": str(st.session_state.get("selected_coin") or ""),
             "selected_ids": ",".join(st.session_state.get("selected_ids", []))
-        })
+        }
+        st.query_params.update(q)
     except Exception:
         pass
 
@@ -118,9 +138,10 @@ def auth_gate() -> None:
         c1, c2 = top.columns([6,1])
         c1.success("Zugriff gewährt.")
         if c2.button("Logout"):
+            save_state(PERSIST_KEYS)
             st.session_state["AUTH_OK"] = False
             st.success("Einstellungen gespeichert.")
-            time.sleep(0.15)
+            time.sleep(0.2)
             st.rerun()
         return
 
@@ -130,7 +151,9 @@ def auth_gate() -> None:
         if ok:
             if pw == secret_pw:
                 st.session_state["AUTH_OK"] = True
+                restore_state(PERSIST_KEYS)
                 ensure_defaults()
+                # URL laden (falls vorhanden)
                 load_from_query_params()
                 st.rerun()
             else:
@@ -139,7 +162,8 @@ def auth_gate() -> None:
 
 auth_gate()
 ensure_defaults()
-load_from_query_params()  # erste Befüllung aus URL
+# Beim (Re)Start: URL → Settings holen
+load_from_query_params()
 
 # ================= Constants & HTTP =================
 FIAT = "usd"
@@ -153,7 +177,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/6.0 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/5.7 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -175,9 +199,9 @@ def _get_json(url, params=None, timeout=12, retries=2, backoff=1.6) -> Dict:
     return {"ok": False, "json": None, "status": None, "error": last_err or "request failed"}
 
 # ================= Formatting =================
-def fmt2(n: float) -> str:
+def fmt_money(n: float, decimals: int = 2) -> str:
     if n is None or (isinstance(n, float) and math.isnan(n)): return ""
-    return f"{n:,.2f}"
+    return f"{n:,.{decimals}f}"
 
 # ================= Basic helpers =================
 def ma(series: pd.Series, window: int) -> pd.Series:
@@ -241,7 +265,7 @@ def binance_top100_by_quote_volume() -> pd.DataFrame:
     df["id"] = df["symbol"]
     return df[["rank","id","symbol","name","symbol_txt","quoteVolume"]].rename(columns={"symbol_txt":"symbol2"})
 
-# ---------- CG nur für Namen ----------
+# ---------- CoinGecko nur für Namensauflösung ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def cg_top_coins(limit: int = 500) -> pd.DataFrame:
     rows = []; per_page = 250; pages = int(np.ceil(limit / per_page))
@@ -256,12 +280,13 @@ def cg_top_coins(limit: int = 500) -> pd.DataFrame:
     if not rows: return pd.DataFrame(columns=["id","symbol","name","market_cap"])
     return pd.concat(rows, ignore_index=True).drop_duplicates(subset=["id"]).head(limit)
 
-# ---------- Mapping zu Binance-Symbol ----------
+# ---------- CG-ID → Binance-Symbol Mapping ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_to_binance_symbol(coin_id_or_symbol: str) -> Optional[str]:
     if not coin_id_or_symbol: return None
     s = str(coin_id_or_symbol).strip()
-    if s.upper().endswith("USDT"): return s.upper()
+    if s.upper().endswith("USDT"):
+        return s.upper()
     base = s.upper()
     info = binance_exchange_info()
     if not info.empty and base in set(info["baseAsset"].str.upper()):
@@ -276,7 +301,7 @@ def resolve_to_binance_symbol(coin_id_or_symbol: str) -> Optional[str]:
             return str(sym)
     return None
 
-# ---------- Historie ----------
+# ---------- History (Binance-first) ----------
 @st.cache_data(ttl=1200, show_spinner=False)
 def load_history(coin_or_symbol: str, days: int = 180) -> pd.DataFrame:
     def _empty(status_text: str, source: str = "") -> pd.DataFrame:
@@ -376,12 +401,12 @@ def telegram_alert_for_entries(df: pd.DataFrame) -> List[str]:
     st.session_state["auto_alerted_ids"] = list(sent_before)
     return alerted
 
-# ================= Sidebar (persist on change) =================
+# ================= Sidebar (Settings + Test) =================
 st.sidebar.header("Settings")
 
-st.session_state["days_hist"] = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15, key="days_hist")
-st.session_state["vol_surge_thresh"] = st.sidebar.slider("Vol Surge vs 7d (x)", 1.0, 5.0, float(st.session_state["vol_surge_thresh"]), 0.1, key="vol_surge")
-st.session_state["lookback_res"] = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 60, int(st.session_state["lookback_res"]), 1, key="lookback")
+days_hist = st.sidebar.slider("Historie (Tage)", 60, 365, int(st.session_state["days_hist"]), 15, key="days_hist")
+vol_surge_thresh = st.sidebar.slider("Vol Surge vs 7d (x)", 1.0, 5.0, float(st.session_state["vol_surge_thresh"]), 0.1, key="vol_surge")
+lookback_res = st.sidebar.slider("Lookback für Widerstand/Support (Tage)", 10, 60, int(st.session_state["lookback_res"]), 1, key="lookback")
 
 st.session_state["top100_cooldown_min"] = st.sidebar.number_input(
     "Top-100 Refresh-Sperre (Minuten)", min_value=1, max_value=120,
@@ -389,51 +414,71 @@ st.session_state["top100_cooldown_min"] = st.sidebar.number_input(
 )
 
 c_as1, c_as2 = st.sidebar.columns([1,1])
-st.session_state["alerts_enabled"] = c_as1.checkbox("Telegram aktiv", value=bool(st.session_state["alerts_enabled"]), key="alerts_enabled_cb")
-st.session_state["auto_scan_enabled"] = c_as2.checkbox("Auto-Scan", value=bool(st.session_state["auto_scan_enabled"]), key="auto_enabled")
-st.session_state["auto_scan_hours"]   = st.sidebar.number_input("Intervall (Std.)", min_value=0.5, max_value=24.0, step=0.5, value=float(st.session_state["auto_scan_hours"]), key="auto_hours")
+st.session_state["auto_scan_enabled"] = c_as1.checkbox("Auto-Scan & Telegram", value=bool(st.session_state["auto_scan_enabled"]), key="auto_enabled")
+st.session_state["auto_scan_hours"]   = c_as2.number_input("Intervall (Std.)", min_value=0.5, max_value=24.0, step=0.5, value=float(st.session_state["auto_scan_hours"]), key="auto_hours")
 
 c_scan1, c_scan2 = st.sidebar.columns(2)
 scan_now_full  = c_scan1.button("🔁 Ganze Watchlist", key="scan_btn_full")
 refresh_top100 = c_scan2.button("🔄 Top-100 aktualisieren", key="top100_refresh")
-st.session_state["batch_size_slider"] = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 15, int(st.session_state["batch_size_slider"]), 1, key="batch_size_slider")
+batch_size = st.sidebar.slider("Coins pro Scan (Batchgröße)", 2, 15, int(st.session_state["batch_size_slider"]), 1, key="batch_size_slider")
 scan_now_batch = st.sidebar.button("🔔 Batch scannen", key="scan_btn_batch")
 if st.sidebar.button("🔄 Batch zurücksetzen", key="reset_batch_btn"):
     st.session_state["scan_index"] = 0
 
-# 🔧 Fake-Entry-Test
+# ---- 🔧 Test: Fake-Entry-Alarm
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔧 Test")
-test_coin_input = st.sidebar.text_input("Fake-Entry (ID/BASE/BASEUSDT)", value="", key="test_coin_input")
+test_coin_input = st.sidebar.text_input("Fake-Entry für (ID/BASE/BASEUSDT)", value="", key="test_coin_input")
 if st.sidebar.button("🚨 Test: Fake Entry-Alarm", key="btn_fake_entry"):
     target = (test_coin_input or "").strip()
-    if target:
+    if not target:
+        st.sidebar.warning("Bitte Coin-ID/BASE/BASEUSDT eingeben (z. B. RNDR oder RNDRUSDT).")
+    else:
         sym = resolve_to_binance_symbol(target) or target.upper()
         set_active_coin(sym)
-        st.query_params.update({"selected_coin": sym})
-        # minimaler Signals-Eintrag
+        # persist sofort
+        st.query_params.update({"coin": sym})
+        # Signaleintrag für Test
         sig = st.session_state.get("signals_cache", pd.DataFrame()).copy()
-        base = sym[:-4] if sym.endswith("USDT") else sym
+        name, symbol = (sym[:-4], sym[:-4]) if sym.endswith("USDT") else (sym, sym)
         row = {
-            "universe": "Watchlist","rank": 0,"name": base,"symbol": base,"id": sym,
-            "price": np.nan,"MA20": np.nan,"MA50": np.nan,"Vol_Surge_x": 2.0,
-            "Resistance": np.nan,"Support": np.nan,"Breakout_MA": True,"Breakout_Resistance": True,
-            "Distribution_Risk": False,"Entry_Signal": True,"status": "ok","source": "test"
+            "universe": "Watchlist",
+            "rank": 0,
+            "name": name,
+            "symbol": symbol,
+            "id": sym,
+            "price": np.nan,
+            "MA20": np.nan,
+            "MA50": np.nan,
+            "Vol_Surge_x": 2.0,
+            "Resistance": np.nan,
+            "Support": np.nan,
+            "Breakout_MA": True,
+            "Breakout_Resistance": True,
+            "Distribution_Risk": False,
+            "Entry_Signal": True,
+            "status": "ok",
+            "source": "test"
         }
-        if sig.empty: sig = pd.DataFrame([row])
-        else: sig = pd.concat([pd.DataFrame([row]), sig], ignore_index=True)
+        if sig.empty:
+            sig = pd.DataFrame([row])
+        else:
+            if sym in set(sig["id"].astype(str)):
+                idx = sig.index[sig["id"].astype(str) == sym][0]
+                for k,v in row.items():
+                    sig.loc[idx, k] = v
+            else:
+                sig = pd.concat([pd.DataFrame([row]), sig], ignore_index=True)
         st.session_state["signals_cache"] = sig
+
         app_url = st.secrets.get("APP_URL", "")
         link = f"\n{app_url}?coin={sym}" if app_url else ""
-        send_telegram(f"[TEST] 🚨 Entry-Signal: {base} ({base}){link}")
+        send_telegram(f"[TEST] 🚨 Entry-Signal: {name} ({symbol}){link}")
         st.sidebar.success("Test-Alarm gesendet & Coin aktiviert.")
 
-# 👉 Persistiere Settings sofort, wenn Sidebar geladen wurde/ändert
-persist_to_query_params()
+st.caption("🔒 Passwortschutz aktiv • Watchlist-Verwaltung ausschließlich über die Tabelle (➕/🗑).")
 
-st.caption("🔒 Passwortschutz aktiv • Watchlist-Verwaltung über die Tabelle (➕/🗑).")
-
-# ================= Utility: Namen =================
+# ================= Utility: Name/Symbol =================
 @st.cache_data(ttl=3600, show_spinner=False)
 def cg_names() -> pd.DataFrame:
     return cg_top_coins(limit=500)
@@ -456,12 +501,13 @@ def _name_and_symbol_any(coin_id_or_symbol: str) -> Tuple[str,str]:
     if s.endswith("USDT"): s = s[:-4]
     return s, s
 
-# ================= Scans =================
+# ================= Signals & Levels — Core Scan =================
 def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, lookback: int,
                          progress_label: str = "Scanne …") -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     rows, history_cache = [], {}
     total = len(id_list)
-    if total == 0: return pd.DataFrame(), {}
+    if total == 0:
+        return pd.DataFrame(), {}
     prog  = st.progress(0, text=progress_label)
     note  = st.empty()
     PAUSE_BETWEEN = 0.45
@@ -520,20 +566,22 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
 
     prog.progress(1.0, text=f"{progress_label} (fertig)")
     note.empty()
-    df = pd.DataFrame(rows).sort_values("rank", kind="stable").reset_index(drop=True)
+    df = pd.DataFrame(rows)
+    df = df.sort_values("rank", kind="stable").reset_index(drop=True)
     return df, history_cache
 
 def run_scan_full_watchlist():
     ids = list(st.session_state.get("selected_ids", []))
     if not ids:
-        st.warning("Watchlist ist leer. Füge Coins aus der Tabelle hinzu.")
+        st.warning("Watchlist ist leer. Füge Coins aus der Tabelle (Top-100/Entry) hinzu.")
         return pd.DataFrame(), {}
-    return compute_rows_for_ids(ids, st.session_state["days_hist"], st.session_state["vol_surge_thresh"], st.session_state["lookback_res"], "Watchlist-Scan")
+    df, cache = compute_rows_for_ids(ids, st.session_state["days_hist"], st.session_state["vol_surge_thresh"], st.session_state["lookback_res"], "Watchlist-Scan")
+    return df, cache
 
 def run_scan_batch():
     ids = list(st.session_state.get("selected_ids", []))
     if not ids:
-        st.warning("Watchlist ist leer.")
+        st.warning("Watchlist ist leer. Füge Coins aus der Tabelle hinzu.")
         return pd.DataFrame(), {}
     start = st.session_state.get("scan_index", 0)
     end = min(start + int(st.session_state["batch_size_slider"]), len(ids))
@@ -545,18 +593,20 @@ def run_scan_batch():
     st.session_state["scan_index"] = end % max(1, len(ids))
     return df, cache
 
+# Aktionen
 if scan_now_full:
     sig, hist_cache = run_scan_full_watchlist()
-    if not sig.empty: st.session_state["signals_cache"] = sig
+    if not sig.empty:
+        st.session_state["signals_cache"] = sig
     st.session_state["history_cache"].update(hist_cache)
-    persist_to_query_params()
 
 if scan_now_batch:
     sig, hist_cache = run_scan_batch()
-    if not sig.empty: st.session_state["signals_cache"] = sig
+    if not sig.empty:
+        st.session_state["signals_cache"] = sig
     st.session_state["history_cache"].update(hist_cache)
-    persist_to_query_params()
 
+# Top-100 Build & Refresh
 def build_top100(days_hist: int, vol_surge_thresh: float, lookback_res: int) -> pd.DataFrame:
     base = binance_top100_by_quote_volume()
     if base.empty:
@@ -594,7 +644,6 @@ if should_refresh or st.session_state["top100_df"].empty:
         st.session_state["top100_last_sync_ts"] = time.time()
         if st.session_state.get("alerts_enabled", True) and should_refresh:
             telegram_alert_for_entries(df100_new)
-        persist_to_query_params()
 
 # Auto-Scan
 if st.session_state["auto_scan_enabled"]:
@@ -610,7 +659,6 @@ if st.session_state["auto_scan_enabled"]:
                 if hits:
                     st.session_state["selected_coin"] = hits[0]
         st.session_state["auto_last_ts"] = time.time()
-        persist_to_query_params()
 
 # ===================== Eine Tabelle (Union) =====================
 st.markdown("---")
@@ -623,8 +671,11 @@ if ts:
 
 watch_df = st.session_state.get("signals_cache", pd.DataFrame()).copy()
 top_df   = st.session_state.get("top100_df", pd.DataFrame()).copy()
-if not watch_df.empty: watch_df["universe"] = "Watchlist"
-if not top_df.empty:   top_df["universe"]  = "Top100"
+
+if not watch_df.empty:
+    watch_df["universe"] = "Watchlist"
+if not top_df.empty:
+    top_df["universe"] = "Top100"
 
 union = pd.concat([watch_df.assign(_prio=0), top_df.assign(_prio=1)], ignore_index=True)
 if not union.empty:
@@ -639,10 +690,18 @@ elif flt == "Watchlist":
 else:
     union = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
 
+# Query-Param → aktiver Coin (nur wenn nicht gesetzt)
+if st.session_state.get("selected_coin") is None:
+    qp_coin = st.query_params.get("coin")
+    if qp_coin:
+        st.session_state["selected_coin"] = str(qp_coin)
+
 if union.empty:
     st.info("Keine Daten für den gewählten Filter. Top-100 aktualisieren oder Watchlist scannen.")
 else:
     display = union.copy()
+
+    # Dist_Risk für Anzeige (aus Distribution_Risk)
     display["Dist_Risk"] = display.get("Distribution_Risk", False)
 
     def _src_short(s: str) -> str:
@@ -656,24 +715,25 @@ else:
     if "rank" in display.columns:
         display = display.sort_values("rank", kind="stable").reset_index(drop=True)
 
-    cols = ["universe","rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
-            "Resistance","Support","Breakout_MA","Breakout_Resistance","Dist_Risk",
-            "Entry_Signal","status","src","id"]
-    for c in cols:
+    show_cols = ["universe","rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
+                 "Resistance","Support","Breakout_MA","Breakout_Resistance","Dist_Risk",
+                 "Entry_Signal","status","src","id"]
+    for c in show_cols:
         if c not in display.columns:
             display[c] = np.nan if c in ["price","MA20","MA50","Vol_Surge_x","Resistance","Support"] else ""
-    display = display[cols].copy()
+    display = display[show_cols].copy()
 
+    # ==== AG Grid (Header fix, Scroll) ====
     gb = GridOptionsBuilder.from_dataframe(display)
     gb.configure_default_column(filter=True, sortable=True, resizable=True)
 
-    fmt_num = JsCode("""
+    fmt2 = JsCode("""
         function(params){
             if (params.value == null || isNaN(params.value)) return '';
             return Number(params.value).toLocaleString(undefined,{maximumFractionDigits:2});
         }
     """)
-    fmt_numx = JsCode("""
+    fmt2x = JsCode("""
         function(params){
             if (params.value == null || isNaN(params.value)) return '';
             return Number(params.value).toLocaleString(undefined,{maximumFractionDigits:2}) + 'x';
@@ -697,42 +757,49 @@ else:
         }
     """)
 
-    # Spalten
     gb.configure_column("id", hide=True)
-    gb.configure_column("universe", headerName="Ursprung", hide=True)
-    gb.configure_column("symbol", headerName="Ticker", hide=True)
+    gb.configure_column("universe", headerName="Ursprung", hide=True)  # wie gewünscht ausblenden
+    gb.configure_column("symbol", headerName="Ticker", hide=True)      # wie gewünscht ausblenden
     gb.configure_column("rank", headerName="Rang", width=90, sort="asc")
-    gb.configure_column("name", headerName="Name", width=160)
+    gb.configure_column("name", headerName="Name", width=140)
 
-    gb.configure_column("price", headerName="Price", type=["rightAligned"], valueFormatter=fmt_num)
-    gb.configure_column("MA20", headerName="MA20", type=["rightAligned"], valueFormatter=fmt_num)
-    gb.configure_column("MA50", headerName="MA50", type=["rightAligned"], valueFormatter=fmt_num)
-    gb.configure_column("Resistance", headerName="Resistance", type=["rightAligned"], valueFormatter=fmt_num)
-    gb.configure_column("Support", headerName="Support", type=["rightAligned"], valueFormatter=fmt_num)
-    gb.configure_column("Vol_Surge_x", headerName="Vol x7d", type=["rightAligned"], valueFormatter=fmt_numx, cellStyle=cell_style_vol)
+    gb.configure_column("price", headerName="Price", type=["rightAligned"], valueFormatter=fmt2)
+    gb.configure_column("MA20", headerName="MA20", type=["rightAligned"], valueFormatter=fmt2)
+    gb.configure_column("MA50", headerName="MA50", type=["rightAligned"], valueFormatter=fmt2)
+    gb.configure_column("Resistance", headerName="Resistance", type=["rightAligned"], valueFormatter=fmt2)
+    gb.configure_column("Support", headerName="Support", type=["rightAligned"], valueFormatter=fmt2)
+
+    gb.configure_column("Vol_Surge_x", headerName="Vol x7d", type=["rightAligned"], valueFormatter=fmt2x, cellStyle=cell_style_vol)
     gb.configure_column("Breakout_MA", headerName="Breakout MA", cellStyle=cell_style_bool)
     gb.configure_column("Breakout_Resistance", headerName="Breakout Resistance", cellStyle=cell_style_bool)
     gb.configure_column("Entry_Signal", headerName="Entry", cellStyle=cell_style_bool)
     gb.configure_column("Dist_Risk", headerName="Dist_Risk", cellStyle=cell_style_bool)
+
     gb.configure_column("status", headerName="Status", width=90)
     gb.configure_column("src", headerName="Daten", width=80)
 
-    # Auswahl & Double-Click → selektieren
     gb.configure_selection(selection_mode="single", use_checkbox=False)
+
     js_dbl = JsCode("""
-        function(params){
-            // Doppelklick selektiert die Zeile (single select)
-            params.api.forEachNode(function(n){ n.setSelected(false); });
-            params.node.setSelected(true);
+        function(e) {
+            e.api.forEachNode(function(n){ n.setSelected(false); });
+            e.node.setSelected(true);
         }
     """)
+
     opts = gb.build()
-    opts["suppressRowClickSelection"] = True
+    if "columnDefs" in opts:
+        for col in opts["columnDefs"]:
+            col["checkboxSelection"] = False
+            col["headerCheckboxSelection"] = False
+
+    # Header bleibt sichtbar, Grid hat eigene Scroll-Area
     opts["rowSelection"] = "single"
+    opts["suppressRowClickSelection"] = True
     opts["rowMultiSelectWithClick"] = False
     opts["domLayout"] = "normal"
-    opts["onRowDoubleClicked"] = js_dbl
 
+    # Höhe damit Scroll aktiv ist (Header fix)
     grid = AgGrid(
         display,
         gridOptions=opts,
@@ -748,33 +815,62 @@ else:
         chosen_id = str(sel[0]["id"])
         if st.session_state.get("selected_coin") != chosen_id:
             st.session_state["selected_coin"] = chosen_id
-            st.query_params.update({"selected_coin": chosen_id})
+            st.query_params.update({"coin": chosen_id})
             persist_to_query_params()
             st.rerun()
 
-# ---------- Watchlist Add/Remove Buttons ----------
-def _base(s: str) -> str:
-    s = str(s).upper()
+# ---------- Watchlist: Add/Remove über Tabelle ----------
+def _binance_base(asset_or_symbol: str) -> str:
+    s = str(asset_or_symbol).upper()
     return s[:-4] if s.endswith("USDT") else s
 
-btn_col1, btn_col2 = st.columns(2)
+btn_col1, btn_col2 = st.columns([1,1])
+
+# (A) Selektierte Zeile → Pending-Add
 if 'sel' in locals() and sel:
-    chosen = str(sel[0]["id"])
-    base = _base(chosen)
-    if btn_col1.button(f"➕ {base} zur Watchlist", key=f"add_{chosen}"):
-        wl = set(st.session_state.get("selected_ids", [])); wl.add(base)
-        st.session_state["selected_ids"] = list(wl); persist_to_query_params(); st.rerun()
-    if base in set(st.session_state.get("selected_ids", [])):
-        if btn_col2.button(f"🗑 {base} aus Watchlist", key=f"rem_{chosen}"):
-            wl = list(st.session_state.get("selected_ids", []))
-            if base in wl: wl.remove(base)
-            st.session_state["selected_ids"] = wl; persist_to_query_params(); st.rerun()
+    _sel_id = str(sel[0]["id"])
+    _sel_base = _binance_base(_sel_id)
+    if btn_col1.button(f"➕ {_sel_base} zur Watchlist", key=f"add_wl_btn_{_sel_id}"):
+        if _sel_base not in st.session_state["selected_ids"]:
+            st.session_state["selected_ids"] = list(st.session_state["selected_ids"]) + [_sel_base]
+            persist_to_query_params()
+        st.rerun()
+else:
+    btn_col1.write("")
+
+# (B) Entfernen (nur im Watchlist-Filter sinnvoll)
+if 'sel' in locals() and sel and st.session_state.get("selected_ids") and _binance_base(str(sel[0]["id"])) in st.session_state["selected_ids"]:
+    _sel_id2 = str(sel[0]["id"])
+    _sel_base2 = _binance_base(_sel_id2)
+    if btn_col2.button(f"🗑 {_sel_base2} aus Watchlist entfernen", key=f"rem_wl_btn_{_sel_id2}"):
+        wl = list(st.session_state.get("selected_ids", []))
+        if _sel_base2 in wl:
+            wl.remove(_sel_base2)
+            st.session_state["selected_ids"] = wl
+            persist_to_query_params()
+        st.rerun()
+else:
+    btn_col2.write("")
+
+# (C) Alle sichtbaren Entry-Signale → Add
+if 'display' in locals() and not display.empty:
+    if st.button("➕ Alle Entry-Signale (sichtbar) zur Watchlist", key="add_all_entries_btn"):
+        wl = set(st.session_state.get("selected_ids", []))
+        for _, row in display.iterrows():
+            try:
+                if bool(row.get("Entry_Signal", False)) and str(row.get("status","")) == "ok":
+                    wl.add(_binance_base(str(row["id"])))
+            except Exception:
+                continue
+        st.session_state["selected_ids"] = list(wl)
+        persist_to_query_params()
+        st.success("Entry-Signale zur Watchlist hinzugefügt.")
+        st.rerun()
 
 # ===================== Chart + Tools =====================
 st.markdown("---")
 active = st.session_state.get("selected_coin")
 
-# Fallback: falls noch keiner aktiv ist, erster Entry
 if not active and 'union' in locals() and not union.empty:
     df_e = union[(union["Entry_Signal"]==True) & (union["status"]=="ok")]
     if not df_e.empty:
@@ -789,6 +885,8 @@ if active:
         f"Aktiv: {name_badge} ({sym_badge})</div>",
         unsafe_allow_html=True
     )
+
+if active:
     with st.spinner(f"Lade Historie für {active} …"):
         d = st.session_state.get("history_cache", {}).get(active)
         if d is None or not isinstance(d, pd.DataFrame) or d.empty:
@@ -809,7 +907,9 @@ if active:
         dfd["volume"] = pd.to_numeric(dfd["volume"], errors="coerce")
         dfd = dfd.dropna(subset=["timestamp","price"]).set_index("timestamp").sort_index()
         d_daily = dfd.resample("1D").last().dropna(subset=["price"]) if not dfd.empty else dfd
-        if not d_daily.empty:
+        if d_daily.empty:
+            st.warning("Keine Tagesdaten.")
+        else:
             r, s  = calc_local_levels(d_daily, st.session_state["lookback_res"])
             d_daily["ma20"] = ma(d_daily["price"], 20)
             d_daily["ma50"] = ma(d_daily["price"], 50)
@@ -827,6 +927,7 @@ if active:
 
             fig, ax_price = plt.subplots()
             ax_vol = ax_price.twinx()
+
             ax_price.plot(d_daily.index, d_daily["price"], label="Price", linewidth=1.6)
             ax_price.plot(d_daily.index, d_daily["ma20"],  label="MA20", linewidth=1.0)
             ax_price.plot(d_daily.index, d_daily["ma50"],  label="MA50", linewidth=1.0)
@@ -848,7 +949,7 @@ if active:
             plt.tight_layout()
             st.pyplot(fig, use_container_width=True)
 
-            # === Position & Trailing Stop ===
+            # === Position & Trailing Stop (2 Dezimalstellen) ===
             st.markdown("### 🧮 Position & Trailing Stop")
             c1, c2, c3, c4 = st.columns(4)
             last_px = float(d_daily['price'].iloc[-1])
@@ -871,14 +972,20 @@ if active:
 else:
     st.info("Kein aktiver Coin. **Doppelklicke** eine Zeile in der Tabelle, um den Chart zu sehen.")
 
-# ---------- Legende ----------
+# ---------- Signal-Legende ----------
 st.markdown("---")
 st.markdown("""
-**Signal-Legende:**  
-- **Vol x7d**: Grün ≥ Schwelle • Rot < 0.8×7d (Distribution-Risk-Zone)  
-- **Breakout MA / Breakout Resistance / Entry**: Grün = True • Rot = False  
-- **Dist_Risk**: Grün = False • Rot = True
+**Signal-Legende:**
+
+- **Vol x7d**:  
+  Grün = Volumen ≥ Schwelle (Entry-Bedingung erfüllt) · Rot = < 0.8× 7-Tage-Ø (Distributionsgefahr)
+
+- **Breakout MA / Breakout Resistance / Entry**:  
+  Grün = True · Rot = False
+
+- **Dist_Risk** (Distribution Risk):  
+  Grün = False (keine Anzeichen) · Rot = True (Preis ↑ bei Volumen < 0.8× 7d-Ø)
 """)
 
-# Letzter Schritt: persistiere (nochmals) alle Settings/States in URL
+# --- Am Ende: Settings/Watchlist dauerhaft in URL schreiben ---
 persist_to_query_params()
