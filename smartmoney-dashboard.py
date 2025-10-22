@@ -1,13 +1,11 @@
 # smartmoney-dashboard.py
 # -------------------------------------------------------------
 # Smart Money Dashboard — Geschützt (Streamlit)
-# v5.8
-#  - Persistenz: Settings + Watchlist + aktiver Coin in URL (st.query_params)
-#  - Tabelle: fester Header (AG Grid Höhe/Scroll), Dist_Risk-Spalte
-#  - Signal-Legende unterhalb der Tabelle
-#  - Union-Tabelle (Top100 + Watchlist + Entry-Filter)
-#  - DblClick-Aktivierung (onRowDoubleClicked) ohne Checkbox
-#  - Telegram & Auto-Scan bleiben erhalten; Fake-Entry-Test im Sidebar
+# v6.0
+#  - Historie-Slider wirkt überall; History-Cache ist "coin|days"-sensitiv
+#  - Neue Spalte: Chg_24h_% (aus den letzten 2 Schlusskursen)
+#  - Dist_Risk Farblogik: False=grün, True=rot (andere Booleans unverändert)
+#  - (Rest basiert auf deiner letzten stabilen Version)
 # -------------------------------------------------------------
 
 import math
@@ -171,7 +169,7 @@ BINANCE_ENDPOINTS = [
 @st.cache_resource(show_spinner=False)
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "smartmoney-dashboard/5.8 (+streamlit)"})
+    s.headers.update({"User-Agent": "smartmoney-dashboard/6.0 (+streamlit)"})
     adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -450,7 +448,8 @@ if st.sidebar.button("🚨 Test: Fake Entry-Alarm", key="btn_fake_entry"):
             "Distribution_Risk": False,
             "Entry_Signal": True,
             "status": "ok",
-            "source": "test"
+            "source": "test",
+            "Chg_24h_%": np.nan
         }
         if sig.empty:
             sig = pd.DataFrame([row])
@@ -511,26 +510,40 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
         status_val = hist.attrs.get("status", "") if isinstance(hist, pd.DataFrame) else "no_df"
         name, symbol = _name_and_symbol_any(cid)
 
+        # --- Cache mit composite key "symbol|days" ablegen
+        sym = resolve_to_binance_symbol(cid) or str(cid)
+        hist_key = f"{sym}|{int(days_hist)}"
+        if isinstance(hist, pd.DataFrame):
+            history_cache[hist_key] = hist
+
         if (hist is None) or hist.empty or (status_val != "ok"):
             rows.append({
                 "universe": "", "rank": i, "name": name, "symbol": symbol,
-                "id": resolve_to_binance_symbol(cid) or cid, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
+                "id": sym, "price": np.nan, "MA20": np.nan, "MA50": np.nan,
                 "Breakout_MA": False, "Vol_Surge_x": np.nan,
                 "Resistance": np.nan, "Support": np.nan,
                 "Breakout_Resistance": False, "Distribution_Risk": False,
                 "Entry_Signal": False, "status": status_val or "no data",
-                "source": hist.attrs.get("source","") if isinstance(hist,pd.DataFrame) else ""
+                "source": hist.attrs.get("source","") if isinstance(hist,pd.DataFrame) else "",
+                "Chg_24h_%": np.nan
             })
             prog.progress(min(i/total, 1.0), text=f"{progress_label} ({i}/{total})")
             continue
 
-        history_cache[cid] = hist
         dfd = hist.copy()
         dfd["timestamp"] = pd.to_datetime(dfd["timestamp"], utc=True, errors="coerce")
         dfd["price"]  = pd.to_numeric(dfd["price"], errors="coerce")
         dfd["volume"] = pd.to_numeric(dfd["volume"], errors="coerce")
         dfd = dfd.dropna(subset=["timestamp","price"]).set_index("timestamp").sort_index()
         dfd = dfd.resample("1D").last().dropna(subset=["price"])
+
+        # 24h Change %
+        if len(dfd) >= 2:
+            last_p = float(dfd["price"].iloc[-1])
+            prev_p = float(dfd["price"].iloc[-2])
+            chg24 = (last_p/prev_p - 1.0) * 100.0 if prev_p > 0 else np.nan
+        else:
+            chg24 = np.nan
 
         t_sig = trend_signals(dfd)
         v_sig = volume_signals(dfd)
@@ -544,7 +557,7 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
 
         rows.append({
             "universe": "", "rank": i, "name": name, "symbol": symbol,
-            "id": resolve_to_binance_symbol(cid) or cid, "price": price,
+            "id": sym, "price": price,
             "MA20": t_sig["ma20"], "MA50": t_sig["ma50"],
             "Vol_Surge_x": volsurge, "Breakout_MA": t_sig["breakout_ma"],
             "Resistance": resistance, "Support": support,
@@ -552,7 +565,8 @@ def compute_rows_for_ids(id_list: List[str], days_hist: int, vol_thresh: float, 
             "Distribution_Risk": v_sig["distribution_risk"],
             "Entry_Signal": entry_ok and breakout_res,
             "status": "ok",
-            "source": hist.attrs.get("source","")
+            "source": hist.attrs.get("source",""),
+            "Chg_24h_%": chg24
         })
         prog.progress(min(i/total, 1.0), text=f"{progress_label} ({i}/{total})")
 
@@ -705,12 +719,16 @@ else:
     if "rank" in display.columns:
         display = display.sort_values("rank", kind="stable").reset_index(drop=True)
 
-    show_cols = ["universe","rank","name","symbol","price","MA20","MA50","Vol_Surge_x",
+    # Sicherstellen, dass neue Spalte existiert
+    if "Chg_24h_%" not in display.columns:
+        display["Chg_24h_%"] = np.nan
+
+    show_cols = ["universe","rank","name","symbol","price","Chg_24h_%","MA20","MA50","Vol_Surge_x",
                  "Resistance","Support","Breakout_MA","Breakout_Resistance","Dist_Risk",
                  "Entry_Signal","status","src","id"]
     for c in show_cols:
         if c not in display.columns:
-            display[c] = np.nan if c in ["price","MA20","MA50","Vol_Surge_x","Resistance","Support"] else ""
+            display[c] = np.nan if c in ["price","Chg_24h_%","MA20","MA50","Vol_Surge_x","Resistance","Support"] else ""
     display = display[show_cols].copy()
 
     gb = GridOptionsBuilder.from_dataframe(display)
@@ -728,6 +746,15 @@ else:
             return Number(params.value).toLocaleString(undefined,{maximumFractionDigits:2}) + 'x';
         }
     """)
+    fmt_pct = JsCode("""
+        function(params){
+            if (params.value == null || isNaN(params.value)) return '';
+            let v = Number(params.value);
+            return v.toLocaleString(undefined,{maximumFractionDigits:2}) + '%';
+        }
+    """)
+
+    # Vol x7d: Schwelle grün, <0.8 rot
     vol_thresh_js = float(st.session_state["vol_surge_thresh"])
     cell_style_vol = JsCode(f"""
         function(params) {{
@@ -738,10 +765,19 @@ else:
             return {{}};
         }}
     """)
+    # Standard-Boolean: True grün, False rot
     cell_style_bool = JsCode("""
         function(params){
             if (params.value === true)  return {backgroundColor:'#e6ffed', color:'#065f46', fontWeight:'600', textAlign:'center'};
             if (params.value === false) return {backgroundColor:'#ffecec', color:'#7f1d1d', fontWeight:'600', textAlign:'center'};
+            return {};
+        }
+    """)
+    # Dist_Risk invertiert: False grün, True rot
+    cell_style_dist = JsCode("""
+        function(params){
+            if (params.value === false) return {backgroundColor:'#e6ffed', color:'#065f46', fontWeight:'600', textAlign:'center'};
+            if (params.value === true)  return {backgroundColor:'#ffecec', color:'#7f1d1d', fontWeight:'600', textAlign:'center'};
             return {};
         }
     """)
@@ -754,6 +790,7 @@ else:
     gb.configure_column("name", headerName="Name", width=140)
 
     gb.configure_column("price", headerName="Price", type=["rightAligned"], valueFormatter=fmt2)
+    gb.configure_column("Chg_24h_%", headerName="Chg 24h %", type=["rightAligned"], valueFormatter=fmt_pct)
     gb.configure_column("MA20", headerName="MA20", type=["rightAligned"], valueFormatter=fmt2)
     gb.configure_column("MA50", headerName="MA50", type=["rightAligned"], valueFormatter=fmt2)
     gb.configure_column("Resistance", headerName="Resistance", type=["rightAligned"], valueFormatter=fmt2)
@@ -763,7 +800,7 @@ else:
     gb.configure_column("Breakout_MA", headerName="Breakout MA", cellStyle=cell_style_bool)
     gb.configure_column("Breakout_Resistance", headerName="Breakout Resistance", cellStyle=cell_style_bool)
     gb.configure_column("Entry_Signal", headerName="Entry", cellStyle=cell_style_bool)
-    gb.configure_column("Dist_Risk", headerName="Dist_Risk", cellStyle=cell_style_bool)
+    gb.configure_column("Dist_Risk", headerName="Dist_Risk", cellStyle=cell_style_dist)
 
     gb.configure_column("status", headerName="Status", width=90)
     gb.configure_column("src", headerName="Daten", width=80)
@@ -790,7 +827,7 @@ else:
         update_mode=GridUpdateMode.SELECTION_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=True,
-        height=520  # sorgt für Scrollbar -> Header bleibt oben
+        height=520  # Scroll aktiv -> Header bleibt sichtbar
     )
 
     sel = grid.get("selected_rows", [])
@@ -853,13 +890,15 @@ if active:
     )
 
 if active:
+    # composite cache key: "coin|days"
+    hkey = f"{active}|{int(st.session_state['days_hist'])}"
     with st.spinner(f"Lade Historie für {active} …"):
-        d = st.session_state.get("history_cache", {}).get(active)
+        d = st.session_state.get("history_cache", {}).get(hkey)
         if d is None or not isinstance(d, pd.DataFrame) or d.empty:
             d = load_history(active, days=st.session_state["days_hist"])
             if isinstance(d, pd.DataFrame) and not d.empty:
                 st.session_state.setdefault("history_cache", {})
-                st.session_state["history_cache"][active] = d
+                st.session_state["history_cache"][hkey] = d
 
     status_val = d.attrs.get("status", "") if isinstance(d, pd.DataFrame) else ""
     src_val    = d.attrs.get("source", "")
